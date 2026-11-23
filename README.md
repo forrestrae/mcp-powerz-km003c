@@ -141,11 +141,10 @@ even if a cleanup step hangs.
 | `error` | `t_host`, `kind`, `message`, and `payload` (the PdPacket hex) when a payload failed to parse |
 | `footer` | `stopped_utc`, `reason` (`messages`, `contract`, `identity`, `timeout`, `manual`, or `error`), `counts` by message type, `messages` (non-GoodCRC), `conn`, `marks`, `errors`, `vbus_mv` {`first`, `last`, `min`, `max`} over every poll |
 
-`t_host` is Unix time in seconds; `t_meter_ms` is the meter's uptime in milliseconds.
-Connection events carry only the low 24 bits of the uptime, which wrap every 4.66 hours.
-The writer extends them from the status block of the same poll, and the reader extends
-them again from the nearest status record, so a file that holds only the 24-bit value
-reads correctly. The footer is written on every stop, errors included. A payload that
+`t_host` is Unix time in seconds; `t_meter_ms` is the meter's uptime in milliseconds, a
+32-bit value that PD messages, connection events, and status blocks all carry in full.
+Marks and errors have only `t_host`; readers place them in meter time from the nearest
+status record. The footer is written on every stop, errors included. A payload that
 fails to parse becomes an `error` record and the capture continues; ten failed polls in a
 row end it with reason `error`.
 

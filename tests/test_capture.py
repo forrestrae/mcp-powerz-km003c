@@ -7,7 +7,7 @@ import pytest
 
 from capture_bench import S3, records
 from km003c_mcp.capture import (
-    CaptureSession, CaptureWriter, StopTracker, capture_dir, extend_timestamp24,
+    CaptureSession, CaptureWriter, StopTracker, capture_dir,
     is_discover_identity_ack, new_capture_path,
 )
 
@@ -18,8 +18,8 @@ def status(t_ms, vbus_mv=5000):
     return struct.pack("<IHhHH", t_ms, vbus_mv, 100, 1600, 0)
 
 
-def conn(t24, code):
-    return bytes([0x45]) + (t24 & 0xFFFFFF).to_bytes(3, "little") + bytes([0, code])
+def conn(t_ms, code):
+    return bytes([0x45]) + t_ms.to_bytes(4, "little") + bytes([code])
 
 
 def message(t_ms, sop, wire):
@@ -68,25 +68,13 @@ def test_explicit_file_path_creates_parents_and_refuses_existing(tmp_path):
 
 # --- timestamps -----------------------------------------------------------------------------
 
-@pytest.mark.parametrize("t24, ref, expected", [
-    (0xDF57CB, 0x00DF57DA, 0x00DF57CB),        # firmware 2.0.0, 4.07 h uptime
-    (0xFFFFF0, 0x01000005, 0x00FFFFF0),        # event just before the wrap, status after
-    (0x000002, 0x01000005, 0x01000002),        # both after the first wrap
-    (0x000010, 0x02FFFFF0, 0x03000010),        # event after the wrap, status before
-    (0x123456, None, 0x123456),                # no reference
-])
-def test_extend_timestamp24(t24, ref, expected):
-    assert extend_timestamp24(t24, ref) == expected
-
-
-def test_writer_extends_wrapped_connection_times(tmp_path):
+def test_writer_keeps_32_bit_connection_times(tmp_path):
     s = session(tmp_path)
-    # 4.66 h of uptime: the 24-bit counter wrapped between the two events.
-    s.ingest(status(0x01000005) + conn(0xFFFFF0, 0x11) + conn(0x000002, 0x12))
+    # A real poll past 2^24 ms of uptime: status 40103699, connect at 40103694.
+    s.ingest(bytes.fromhex("13ef6302020000001d060000") + bytes.fromhex("450eef630211"))
     s.finish("manual")
-    recs = records(tmp_path / "c.jsonl")
-    assert [r["t_meter_ms"] for r in recs if r["type"] == "conn"] == [0x00FFFFF0, 0x01000002]
-    assert recs[2]["raw_event"] == "45f0ffff0011"  # the raw 24-bit value is kept
+    (conn_record,) = [r for r in records(tmp_path / "c.jsonl") if r["type"] == "conn"]
+    assert conn_record["t_meter_ms"] == 40103694 and conn_record["raw_event"] == "450eef630211"
 
 
 # --- session --------------------------------------------------------------------------------
