@@ -40,6 +40,7 @@ class Entry:
     decoded: dict | None = None
     sop: int | None = None
     retry: bool = False  # a retransmission of the sender's previous message
+    line: int = 0  # the record's line number in the file: the position used for paging
 
     @property
     def msg(self) -> str | None:
@@ -121,23 +122,23 @@ def load_capture(path: str | Path) -> Capture:
         elif r["type"] == "footer":
             footer = footer or _clean_footer(r, problems)
         else:
-            body.append(r)
+            body.append((n, r))
 
     # Status blocks carry the 32-bit uptime; the nearest one at or before a record (else the
     # next one) is the reference for extending its 24-bit time and for placing marks.
-    status = [r for r in body if r.get("type") == "status"]
+    status = [r for _, r in body if r.get("type") == "status"]
     following: list[dict | None] = [None] * len(body)
     upcoming = None
     for k in range(len(body) - 1, -1, -1):
-        if body[k].get("type") == "status":
-            upcoming = body[k]
+        if body[k][1].get("type") == "status":
+            upcoming = body[k][1]
         following[k] = upcoming
 
     entries: list[Entry] = []
     decoder = PdDecoder()
     retries = RetryFilter()
     last_status: dict | None = None
-    for k, r in enumerate(body):
+    for k, (n, r) in enumerate(body):
         kind = r.get("type")
         if kind == "status":
             last_status = r
@@ -149,9 +150,11 @@ def load_capture(path: str | Path) -> Capture:
             entry = _decode_entry(r, decoder)
             wire = bytes.fromhex(r.get("wire") or "") if _is_hex(r.get("wire")) else b""
             entry.retry = retries.is_retry(entry.sop, wire, entry.goodcrc)
+            entry.line = n
             entries.append(entry)
         elif kind == "conn":
-            entries.append(Entry("conn", extend_timestamp24(r.get("t_meter_ms", 0), ref_t), r))
+            entries.append(Entry("conn", extend_timestamp24(r.get("t_meter_ms", 0), ref_t), r,
+                                 line=n))
         elif kind in ("mark", "error"):
             t = None
             if ref_t is not None and _is_number(r.get("t_host")) and _is_number(ref_host):
@@ -159,7 +162,7 @@ def load_capture(path: str | Path) -> Capture:
                     t = round(ref_t + (r["t_host"] - ref_host) * 1000)
                 except (OverflowError, ValueError):  # inf or NaN host times
                     t = None
-            entries.append(Entry(kind, t, r))
+            entries.append(Entry(kind, t, r, line=n))
     return Capture(p, header, footer, entries, status, problems)
 
 
@@ -568,15 +571,21 @@ def select(capture: Capture, sop=None, types=None, since: int | None = None,
     return out
 
 
-def _page(entries: list[Entry], limit: int) -> tuple[list[Entry], int | None]:
-    """Up to ``limit`` entries, extended to keep entries with equal times together, and the
-    ``since`` value of the next page."""
-    if len(entries) <= limit:
-        return entries, None
-    end = limit
-    while end < len(entries) and entries[end].t is not None and entries[end].t == entries[end - 1].t:
-        end += 1
-    return entries[:end], (entries[end].t if end < len(entries) else None)
+def _page(entries: list[Entry], after: int | None, limit: int) -> tuple[list[Entry], dict]:
+    """The first ``limit`` entries after line ``after``, and the paging fields.
+
+    Pages go by position in the file, not by time: marks and errors carry estimated times
+    that need not be in order, and several entries can share a millisecond. ``next_after``
+    is present only when more entries follow.
+    """
+    if after is not None and not isinstance(after, int):
+        raise ValueError("after must be a line number (next_after of the previous page)")
+    rest = [e for e in entries if after is None or e.line > after]
+    page = rest[:limit]
+    fields = {"count": len(page), "total": len(entries)}
+    if len(rest) > len(page):
+        fields["next_after"] = page[-1].line
+    return page, fields
 
 
 def _limit(mode: str, limit: int | None) -> int:
@@ -587,22 +596,22 @@ def _limit(mode: str, limit: int | None) -> int:
 
 
 def messages(capture: Capture, sop=None, types=None, since=None, limit=None,
-             include_goodcrc=False) -> dict:
+             include_goodcrc=False, after=None) -> dict:
     matched = select(capture, sop, types, since, include_goodcrc)
-    page, next_since = _page(matched, _limit("messages", limit))
-    return {"path": str(capture.path), "lines": [entry_line(e) for e in page],
-            "count": len(page), "total": len(matched), "next_since": next_since}
+    page, fields = _page(matched, after, _limit("messages", limit))
+    return {"path": str(capture.path), "lines": [entry_line(e) for e in page], **fields}
 
 
 def full(capture: Capture, sop=None, types=None, since=None, limit=None,
-         include_goodcrc=False) -> dict:
+         include_goodcrc=False, after=None) -> dict:
     matched = select(capture, sop, types, since, include_goodcrc, messages_only=True)
-    page, next_since = _page(matched, _limit("full", limit))
+    page, fields = _page(matched, after, _limit("full", limit))
     return {"path": str(capture.path),
-            "messages": [{"i": e.record.get("i"), "t": e.t, "sop": e.record.get("sop"),
+            "messages": [{"line": e.line, "i": e.record.get("i"), "t": e.t,
+                          "sop": e.record.get("sop"),
                           "wire": clip(e.record.get("wire"), MAX_HEX_CHARS),
                           "decoded": e.decoded} for e in page],
-            "count": len(page), "total": len(matched), "next_since": next_since}
+            **fields}
 
 
 _VDO_NAMES = {0: "id_header", 1: "cert_stat", 2: "product"}
@@ -682,7 +691,7 @@ def facts(capture: Capture) -> dict:
 
 
 def read(path: str | Path, mode: str = "summary", sop=None, types=None, since=None,
-         limit=None, include_goodcrc: bool = False) -> dict:
+         limit=None, include_goodcrc: bool = False, after: int | None = None) -> dict:
     """Load ``path`` and render it in ``mode``.
 
     Raises ValueError for a file that cannot be read as a capture, including one whose
@@ -697,8 +706,8 @@ def read(path: str | Path, mode: str = "summary", sop=None, types=None, since=No
         if mode == "facts":
             return facts(capture)
         if mode == "messages":
-            return messages(capture, sop, types, since, limit, include_goodcrc)
-        return full(capture, sop, types, since, limit, include_goodcrc)
+            return messages(capture, sop, types, since, limit, include_goodcrc, after)
+        return full(capture, sop, types, since, limit, include_goodcrc, after)
     except (AttributeError, TypeError, KeyError, IndexError) as exc:
         raise ValueError(f"{capture.path}: malformed capture file "
                          f"({type(exc).__name__}: {exc})") from exc
