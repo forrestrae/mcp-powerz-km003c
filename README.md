@@ -15,7 +15,9 @@ Requires Python 3.11+. On Windows the meter's vendor interface already uses the 
 driver, so no extra driver is needed; `libusb-package` ships the libusb DLL.
 
 **Close the ChargerLab POWER-Z PC software first** — only one program can hold the
-meter's USB interface. The server reports `DeviceBusyError` otherwise.
+meter's USB interface. The server reports `DeviceBusyError` otherwise, with the likely
+holders; on macOS it also names the holding process from `ioreg`, for example
+`pid 46945, python3.14`.
 
 ### macOS and Linux
 
