@@ -253,10 +253,10 @@ def test_trigger_tools_follow_the_default_when_unset(monkeypatch):
     assert not set(srv.TRIGGER_TOOLS) & registered_tools()
 
 
-def test_upstream_default_registers_trigger_tools(monkeypatch):
+def test_fork_default_leaves_trigger_tools_out(monkeypatch):
     monkeypatch.delenv("KM003C_ENABLE_TRIGGER", raising=False)
-    assert srv.DEFAULT_ENABLE_TRIGGER is True
-    assert set(srv.TRIGGER_TOOLS) <= registered_tools()
+    assert srv.DEFAULT_ENABLE_TRIGGER is False
+    assert not set(srv.TRIGGER_TOOLS) & registered_tools()
 
 
 @pytest.mark.parametrize("value", ["false", "no", "off", "yes", "true", "2", " 0 "])

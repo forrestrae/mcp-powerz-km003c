@@ -102,11 +102,6 @@ def test_zero_releases_at_once():
     assert len(bench.meters) == 2 and bench.released(bench.meters[1])
 
 
-def test_default_idle_release_is_never():
-    # Upstream's default: unset KM003C_IDLE_RELEASE_S keeps the meter claimed.
-    assert srv.DEFAULT_IDLE_RELEASE_S is None
-
-
 def test_upstream_default_never_releases(monkeypatch):
     monkeypatch.delenv("KM003C_IDLE_RELEASE_S", raising=False)
     monkeypatch.setattr(srv, "DEFAULT_IDLE_RELEASE_S", None)
@@ -245,6 +240,14 @@ def test_lease_release_is_idempotent():
     lease.release()
     lease.release()
     assert bench.service.leases() == {}
+
+
+def test_fork_default_releases_after_2_s(monkeypatch):
+    # The fork's default, unlike upstream's None: release 2 s after the last lease ends.
+    assert srv.DEFAULT_IDLE_RELEASE_S == 2.0
+    monkeypatch.delenv("KM003C_IDLE_RELEASE_S", raising=False)
+    assert idle_release_from_env() == 2.0
+    assert Km003cService(transport_factory=MeterFake).idle_release_s == 2.0
 
 
 @pytest.mark.parametrize("value, expected", [
