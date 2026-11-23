@@ -523,7 +523,7 @@ def build_tools(service: Km003cService, enable_trigger: bool | None = None) -> S
         """Wait up to timeout_s for the running capture to stop, then return its summary.
 
         running is True in the result when the capture is still going; reason says why it
-        stopped. Waiting does not stop the capture.
+        stopped. Waiting does not stop the capture. timeout_s is clamped to 0 to 86400.
         """
         service.recorder.wait_pd(timeout_s)
         return capture_summary(current_capture())
