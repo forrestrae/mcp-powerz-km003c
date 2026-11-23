@@ -232,8 +232,8 @@ class PdEvent:
 
     ``kind`` is ``connect``, ``disconnect``, ``connection`` (an unknown connection code), or
     ``message``. ``code`` is the connection-event code byte, None for messages. ``raw`` is the
-    record as received: the 6-byte event header followed by the wire bytes. A connection
-    event's timestamp is 24 bits wide; a message's is 32 bits.
+    record as received: the 6-byte event header followed by the wire bytes. Both kinds carry
+    the meter's 32-bit uptime in milliseconds in header bytes 1 to 4.
     """
 
     timestamp_ms: int
@@ -283,7 +283,10 @@ def split_pd(payload: bytes) -> PdPayload:
                              f"truncated PD event header at offset {offset}")
         head = bytes(payload[offset:offset + PD_EVENT_HEADER_SIZE])
         if head[0] == PD_EVENT_CONNECTION:
-            ts = int.from_bytes(head[1:4], "little")
+            # Bytes 1 to 4 are the 32-bit uptime, as for messages; byte 5 is the code. A
+            # KM003C on firmware 2.0.0 past 2^24 ms of uptime sent 45 0e ef 63 02 11, which is
+            # 40103694 ms (0x0263ef0e), in a poll whose status block read 40103699 ms.
+            ts = struct.unpack_from("<I", head, 1)[0]
             code = head[5]
             kind = ("connect" if code in PD_EVENT_CONNECT
                     else "disconnect" if code in PD_EVENT_DISCONNECT else "connection")

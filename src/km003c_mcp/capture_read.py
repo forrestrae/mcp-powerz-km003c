@@ -9,7 +9,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .capture import FORMAT, VERSION, RetryFilter, capture_dir, extend_timestamp24
+from .capture import FORMAT, VERSION, RetryFilter, capture_dir
 from .pd import SOP_NAMES, PdDecoder
 from .pd_objects import bits
 from .protocol import PdEvent
@@ -77,7 +77,7 @@ def resolve_path(path: str | Path) -> Path:
 
 
 def load_capture(path: str | Path) -> Capture:
-    """Parse a capture file, extend 24-bit timestamps, and decode every PD message.
+    """Parse a capture file, place marks and errors in meter time, and decode every message.
 
     A malformed last line (a capture cut off mid-write) and other unreadable lines are
     reported in ``problems`` instead of raising. Raises ValueError when the file is not a
@@ -124,8 +124,8 @@ def load_capture(path: str | Path) -> Capture:
         else:
             body.append((n, r))
 
-    # Status blocks carry the 32-bit uptime; the nearest one at or before a record (else the
-    # next one) is the reference for extending its 24-bit time and for placing marks.
+    # Marks and errors carry only host time; the nearest status record at or before one (else
+    # the next one) converts it to meter time.
     status = [r for _, r in body if r.get("type") == "status"]
     following: list[dict | None] = [None] * len(body)
     upcoming = None
@@ -153,8 +153,7 @@ def load_capture(path: str | Path) -> Capture:
             entry.line = n
             entries.append(entry)
         elif kind == "conn":
-            entries.append(Entry("conn", extend_timestamp24(r.get("t_meter_ms", 0), ref_t), r,
-                                 line=n))
+            entries.append(Entry("conn", r["t_meter_ms"], r, line=n))
         elif kind in ("mark", "error"):
             t = None
             if ref_t is not None and _is_number(r.get("t_host")) and _is_number(ref_host):

@@ -30,8 +30,6 @@ FORMAT = "km003c-capture"
 VERSION = 1
 STOP_ON = ("none", "contract", "identity")
 STOP_REASONS = ("messages", "contract", "identity", "timeout", "manual", "error")
-# Connection events carry the low 24 bits of the meter's millisecond uptime.
-TIMESTAMP24_WRAP = 1 << 24
 # Requests and the replies that end one; see StopTracker.
 _REQUESTS = {"Request", "EPR_Request"}
 _REQUEST_ENDS = {"Reject", "Wait", "Soft_Reset", "Not_Supported"}
@@ -46,24 +44,6 @@ def server_version() -> str:
         return metadata.version("km003c-mcp")
     except metadata.PackageNotFoundError:
         return "unknown"
-
-
-def extend_timestamp24(t24: int, reference_ms: int | None) -> int:
-    """Extend a 24-bit meter timestamp to the meter's 32-bit uptime.
-
-    ``reference_ms`` is a nearby 32-bit uptime, such as the status block of the same poll.
-    The result is the value with the same low 24 bits that lies within half a wrap period
-    (2.33 hours) of the reference. Without a reference the 24-bit value is returned.
-    """
-    t24 &= TIMESTAMP24_WRAP - 1
-    if reference_ms is None:
-        return t24
-    value = (reference_ms & ~(TIMESTAMP24_WRAP - 1)) | t24
-    if value - reference_ms > TIMESTAMP24_WRAP // 2:
-        value -= TIMESTAMP24_WRAP
-    elif reference_ms - value > TIMESTAMP24_WRAP // 2:
-        value += TIMESTAMP24_WRAP
-    return value if value >= 0 else t24
 
 
 # --- file location -----------------------------------------------------------------------
@@ -326,7 +306,7 @@ class CaptureSession:
                 self._last_status_t = meter_t
                 status = None
         for event in split.events:
-            self._write_event(event, meter_t)
+            self._write_event(event)
         if split.error is not None:
             self.error("ProtocolError", split.error, payload=payload.hex(), t_host=t_host)
         if self.fired is None or (self.settle_until is not None
@@ -337,11 +317,10 @@ class CaptureSession:
             self._last_status_t = meter_t
         return self.fired
 
-    def _write_event(self, event: PdEvent, meter_t: int | None) -> None:
+    def _write_event(self, event: PdEvent) -> None:
         if event.kind != "message":
             self.conn += 1
-            self.writer.write({"type": "conn",
-                               "t_meter_ms": extend_timestamp24(event.timestamp_ms, meter_t),
+            self.writer.write({"type": "conn", "t_meter_ms": event.timestamp_ms,
                                "code": event.code, "event": event.kind,
                                "raw_event": event.raw.hex()})
             return

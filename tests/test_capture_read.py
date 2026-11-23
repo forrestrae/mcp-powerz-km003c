@@ -141,29 +141,15 @@ def test_bare_name_is_found_in_the_capture_dir(capture_dir):
 
 # --- timestamps -----------------------------------------------------------------------------
 
-def test_reader_extends_wrapped_connection_times(tmp_path):
-    # Conn records holding only the 24-bit value, after 4.66 h of uptime: the counter
-    # wrapped between the two events, and the status of the same poll comes first.
+def test_reader_takes_connection_times_as_stored(tmp_path):
+    # 32-bit times past 2^24 ms are used as they are, not adjusted from the status block.
     path = _write(tmp_path, [
         {"type": "header", "format": "km003c-capture", "version": 1},
-        {"type": "status", "t_host": 1.0, "t_meter_ms": 0x01000005, "vbus_mv": 5000},
-        {"type": "conn", "t_meter_ms": 0xFFFFF0, "code": 0x11, "event": "connect",
-         "raw_event": "45f0ffff0011"},
-        {"type": "conn", "t_meter_ms": 0x000002, "code": 0x12, "event": "disconnect",
-         "raw_event": "450200000012"},
+        {"type": "status", "t_host": 1.0, "t_meter_ms": 40103699, "vbus_mv": 2},
+        {"type": "conn", "t_meter_ms": 40103694, "code": 0x11, "event": "connect",
+         "raw_event": "450eef630211"},
     ])
-    times = [e.t for e in cr.load_capture(path).entries if e.kind == "conn"]
-    assert times == [0x00FFFFF0, 0x01000002]
-
-
-def test_reader_extends_from_a_later_status_when_none_precedes(tmp_path):
-    path = _write(tmp_path, [
-        {"type": "header", "format": "km003c-capture", "version": 1},
-        {"type": "conn", "t_meter_ms": 0x000004, "code": 0x21, "event": "connect",
-         "raw_event": "450400000021"},
-        {"type": "status", "t_host": 1.0, "t_meter_ms": 0x02000010, "vbus_mv": 5000},
-    ])
-    assert cr.load_capture(path).entries[0].t == 0x02000004
+    assert [e.t for e in cr.load_capture(path).entries] == [40103694]
 
 
 # --- messages and full ----------------------------------------------------------------------
@@ -469,3 +455,39 @@ def test_facts_stay_within_their_bound_and_keep_the_contract(tmp_path):
 def test_facts_of_a_short_capture_omit_nothing():
     f = cr.read(GOLDEN, "facts")
     assert f["truncated"] is False and set(f["omitted"].values()) == {0}
+
+
+# --- a real cold attach past 2^24 ms of uptime ----------------------------------------------
+
+COLD = GOLDEN.parent / "cold_attach_fw2.0.0.jsonl"
+
+
+def test_cold_attach_summary_and_facts():
+    s = cr.read(COLD)
+    assert s["reason"] == "contract" and s["warnings"] == [] and s["meter_fw"] == "2.0.0"
+    assert s["contract"] == {"t_ps_rdy": 40104470, "rdo": "4184b12c", "pdo": "000641d6",
+                             "text": "pos 4, 3.0 A of 20.0 V 4.7 A"}
+    f = cr.read(COLD, "facts")
+    contract = f["requests"][f["contract"]["request_index"]]
+    assert contract["rdo"]["object_position"] == 4 and contract["rdo"]["hex"] == "4184b12c"
+    assert contract["ps_rdy_t"] == 40104470
+    acks = f["discover_identity_acks"]
+    assert set(acks) == {"SOP", "SOP'"}
+    assert acks["SOP'"]["cable"][0]["vdos"][0]["decoded"]["vid"] == "0x20c2"
+    assert acks["SOP"]["sink/ufp"][0]["vdos"][0]["decoded"]["vid"] == "0x0451"
+
+
+def test_cold_attach_timestamps_are_32_bit_and_match_the_poll():
+    from km003c_mcp.protocol import split_pd
+    recs = records(COLD)
+    events = [r for r in recs if r["type"] in ("pd", "conn")]
+    assert {r["type"] for r in events} == {"pd", "conn"}
+    status = None
+    for r in recs:
+        if r["type"] == "status":
+            status = r
+        elif r["type"] in ("pd", "conn"):
+            # Reparse each raw event behind its poll's status block: bytes 1 to 4 are a u32.
+            (event,) = split_pd(bytes.fromhex(status["raw"] + r["raw_event"])).events
+            assert event.timestamp_ms == r["t_meter_ms"] > 1 << 24
+            assert 0 <= status["t_meter_ms"] - r["t_meter_ms"] < 1000
