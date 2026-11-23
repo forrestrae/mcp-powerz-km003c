@@ -51,6 +51,7 @@ claude mcp add km003c -- <repo>\.venv\Scripts\km003c-mcp.exe
 |---|---|
 | `KM003C_SERIAL` | Pick a meter by USB serial number when several are attached |
 | `KM003C_COM_PORT` | Override the trigger's virtual serial port (e.g. `COM14`) |
+| `KM003C_PD_POLL_MS` | PD capture poll interval in milliseconds, 1 to 10000 (default 50; the meter buffers a whole negotiation between polls) |
 | `KM003C_LIBUSB` | Load libusb-1.0 from this file instead of the bundled one (`KM003C_LIBUSB_DLL` is the older name and still works) |
 
 ## Tools

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -28,6 +29,16 @@ RECENT_SAMPLES = 20
 # A reply carries at most 63 queued samples and older ones are lost, so at 1000 SPS the
 # queue must be drained well within 63 ms.
 FAST_POLL_INTERVAL_S = 0.02
+# Slower streams are polled at least this often, whatever the PD poll interval is, so a
+# long KM003C_PD_POLL_MS cannot overflow the 63-sample queue at 50 SPS.
+STREAM_POLL_INTERVAL_S = 0.05
+# A KM003C on firmware 2.0.0 returned a whole 16-message negotiation in one poll even at
+# 1000 ms, so 50 ms leaves a wide margin.
+DEFAULT_PD_POLL_MS = 50
+# KM003C_PD_POLL_MS is clamped to this range; a huge value would make the poller's sleep
+# overflow, and the meter gains nothing from polls under 1 ms apart.
+MIN_PD_POLL_MS = 1
+MAX_PD_POLL_MS = 10_000
 
 
 @dataclass
@@ -125,13 +136,36 @@ class _Stream:
             self._csv = None
 
 
+def pd_poll_interval_s() -> float:
+    """PD poll interval: ``KM003C_PD_POLL_MS`` milliseconds if set and positive, else 50 ms.
+
+    Values outside 1 ms to 10 s are clamped to that range, with a warning.
+    """
+    raw = os.environ.get("KM003C_PD_POLL_MS", "").strip()
+    if not raw:
+        return DEFAULT_PD_POLL_MS / 1000
+    try:
+        ms = float(raw)
+    except ValueError:
+        ms = 0
+    if not ms > 0:
+        log.warning("ignoring KM003C_PD_POLL_MS=%r; using %d ms", raw, DEFAULT_PD_POLL_MS)
+        return DEFAULT_PD_POLL_MS / 1000
+    clamped = min(max(ms, MIN_PD_POLL_MS), MAX_PD_POLL_MS)
+    if clamped != ms:
+        log.warning("KM003C_PD_POLL_MS=%r is outside %d to %d ms; using %g ms",
+                    raw, MIN_PD_POLL_MS, MAX_PD_POLL_MS, clamped)
+    return clamped / 1000
+
+
 class Recorder:
-    def __init__(self, device_provider: Callable[[], Km003cDevice], poll_interval_s: float = 0.05,
-                 keep_samples: int = 10_000,
+    def __init__(self, device_provider: Callable[[], Km003cDevice],
+                 poll_interval_s: float | None = None, keep_samples: int = 10_000,
                  on_transport_error: Callable[[], None] | None = None) -> None:
+        """``poll_interval_s`` defaults to :func:`pd_poll_interval_s`."""
         self._provider = device_provider
         self._on_transport_error = on_transport_error
-        self._poll = poll_interval_s
+        self._poll = pd_poll_interval_s() if poll_interval_s is None else poll_interval_s
         self._keep = keep_samples
         self._state = threading.Lock()
         self._thread: threading.Thread | None = None
@@ -175,8 +209,9 @@ class Recorder:
                 mask = (ATT_ADCQUEUE if self._stream else 0) | (ATT_PD if self._pd_active else 0)
                 device = self._device
                 poll = self._poll
-                if self._stream and self._stream.rate_index == 3:
-                    poll = min(poll, FAST_POLL_INTERVAL_S)
+                if self._stream:
+                    poll = min(poll, FAST_POLL_INTERVAL_S if self._stream.rate_index == 3
+                               else STREAM_POLL_INTERVAL_S)
                 if not mask or device is None:
                     self._thread = None
                     return
