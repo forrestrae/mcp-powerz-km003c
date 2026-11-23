@@ -98,9 +98,14 @@ def test_trigger_pd_request_builds_command():
 
 def test_poller_transport_error_reopens_on_next_call():
     import time
-    transports = [FakeTransport(opened()), FakeTransport(opened(live_adc_with_tid(3)))]
+    # Connect (TID 3) and EnablePdMonitor (TID 4) are accepted; the first poll then times out.
+    transports = [FakeTransport(opened(bytes.fromhex("05030000"), bytes.fromhex("05040000"))),
+                  FakeTransport(opened(live_adc_with_tid(3)))]
     tools, _ = make_tools(factory=lambda: transports.pop(0))
-    assert tools.pd_capture_start() == {"started": True}
+    assert tools.pd_capture_start() == {
+        "started": True,
+        "pd_monitor": {"accepted": True, "outcome": "accepted", "attempts": 1,
+                       "last_reply": "05040000"}}
     deadline = time.monotonic() + 3
     while tools.pd_capture_read()["running"] and time.monotonic() < deadline:
         time.sleep(0.01)
@@ -127,3 +132,22 @@ def test_trigger_close_sends_pdm_close():
     tools.trigger_raw("pd pdo", timeout_s=0.1)
     assert tools.trigger_close() == {"command": "pdm close", "lines": ["ok"]}
     assert fs.closed
+
+
+def test_pd_capture_start_reports_reject_as_non_fatal():
+    tools, _ = make_tools(opened(bytes.fromhex("05030000"), bytes.fromhex("06040000")))
+    r = tools.pd_capture_start()
+    assert r["started"] and r["pd_monitor"]["outcome"] == "already enabled or refused"
+    tools._service.recorder.abort("test done")
+
+
+def test_pd_capture_start_fails_when_monitor_never_enabled(monkeypatch):
+    import km003c_mcp.usb_device as ud
+    monkeypatch.setattr(ud, "PD_MONITOR_RETRY_DELAY_S", 0)
+    replies = []
+    for tid in range(3, 13, 2):
+        replies += [bytes([0x05, tid, 0, 0]), bytes([0x03, tid + 1, 0, 0])]
+    tools, _ = make_tools(opened(*replies))
+    r = tools.pd_capture_start()
+    assert r["kind"] == "PdMonitorNotEnabledError"
+    assert tools.pd_capture_read()["running"] is False

@@ -6,8 +6,11 @@ import pytest
 
 from km003c_mcp.protocol import ATT_ADCQUEUE, ATT_PD, LogicalPacket
 from km003c_mcp.recorder import Recorder
-from km003c_mcp.usb_device import Km003cError
+from km003c_mcp.usb_device import Km003cError, PdMonitorEnable, PdMonitorNotEnabledError
 from test_protocol import PD_STREAM
+
+
+ACCEPTED = PdMonitorEnable(True, "accepted", 1, "05010000")
 
 
 class FakeDevice:
@@ -16,6 +19,8 @@ class FakeDevice:
         self.error = error
         self.masks = []
         self.graph = []
+        self.monitor = []
+        self.enable_result = ACCEPTED
         self.lock = threading.RLock()
 
     def get_data(self, mask):
@@ -31,6 +36,16 @@ class FakeDevice:
 
     def stop_graph(self):
         self.graph.append(("stop",))
+
+    def enable_pd_monitor(self):
+        self.monitor.append("enable")
+        if isinstance(self.enable_result, Exception):
+            raise self.enable_result
+        return self.enable_result
+
+    def disable_pd_monitor(self):
+        self.monitor.append("disable")
+        return True
 
 
 def queue(seqs, uv=10_000_000, ua=1_000_000):
@@ -184,3 +199,134 @@ def test_abort_stops_running_capture():
     rec.abort("USB session reset")
     status = rec.stream_status()
     assert not status["running"] and "USB session reset" in status["error"]
+
+
+def test_start_pd_enables_monitor_and_stop_disables_it():
+    dev = FakeDevice()
+    rec = Recorder(lambda: dev, poll_interval_s=0.001)
+    assert rec.pd_monitor is None
+    assert rec.start_pd() == ACCEPTED
+    assert rec.pd_monitor == ACCEPTED and dev.monitor == ["enable"]
+    rec.stop_pd()
+    assert dev.monitor == ["enable", "disable"]
+    rec.stop_pd()  # already stopped: nothing more is sent
+    assert dev.monitor == ["enable", "disable"]
+    assert rec.pd_monitor == ACCEPTED  # still readable after the capture stops
+
+
+def test_start_pd_with_reject_still_captures():
+    dev = FakeDevice([[LogicalPacket(ATT_PD, False, 0, PD_STREAM)]])
+    dev.enable_result = PdMonitorEnable(False, "already enabled or refused", 1, "06010000")
+    rec = Recorder(lambda: dev, poll_interval_s=0.001)
+    assert rec.start_pd().accepted is False
+    wait_until(lambda: rec.pd_events()["total"] == 3)
+    rec.stop_pd()
+
+
+def test_start_pd_does_not_start_when_enable_fails():
+    dev = FakeDevice()
+    dev.enable_result = PdMonitorNotEnabledError("never accepted")
+    rec = Recorder(lambda: dev, poll_interval_s=0.001)
+    with pytest.raises(PdMonitorNotEnabledError):
+        rec.start_pd()
+    assert rec.pd_events()["running"] is False and dev.masks == []
+    assert rec.pd_monitor is None
+
+
+def test_logical_error_disables_pd_monitor():
+    dev = FakeDevice(error=Km003cError("bad reply"))
+    rec = Recorder(lambda: dev, poll_interval_s=0.001)
+    rec.start_pd()
+    wait_until(lambda: dev.monitor == ["enable", "disable"])
+    assert "bad reply" in rec.pd_events()["error"]
+
+
+class LockingDevice(FakeDevice):
+    """FakeDevice whose commands take the device lock, as Km003cDevice's do."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+        self.fail_next = False
+
+    def get_data(self, mask):
+        if self.fail_next:  # a reply that fails to parse; no lock needed to report it
+            self.fail_next = False
+            raise Km003cError("bad reply")
+        with self.lock:
+            return super().get_data(mask)
+
+    def enable_pd_monitor(self):
+        with self.lock:
+            self.calls.append("enable")
+            return super().enable_pd_monitor()
+
+    def disable_pd_monitor(self):
+        with self.lock:
+            self.calls.append("disable")
+            return super().disable_pd_monitor()
+
+
+def test_restart_during_failure_cleanup_gets_a_poller_and_keeps_its_monitor():
+    dev = LockingDevice()
+    rec = Recorder(lambda: dev, poll_interval_s=0.001)
+    rec.start_pd()
+    with dev.lock:
+        # The poller fails and its cleanup waits for the device lock: the window in which the
+        # capture already reads as stopped but the old thread has not sent its disable yet.
+        dev.fail_next = True
+        wait_until(lambda: not rec.pd_events()["running"])
+        rec.start_pd()
+    polls = len(dev.masks)
+    wait_until(lambda: len(dev.masks) > polls + 5)  # the new capture is polled
+    time.sleep(0.05)
+    # The old thread saw the newer start and skipped the disable it would have sent.
+    assert dev.calls == ["enable", "enable"]
+    page = rec.pd_events()
+    assert page["running"] and page["error"] is None
+    rec.stop_pd()
+    assert dev.calls == ["enable", "enable", "disable"]
+    assert rec._thread is None
+
+
+def test_failure_cleanup_runs_before_a_later_start():
+    release = threading.Event()
+
+    class SlowDisable(LockingDevice):
+        def disable_pd_monitor(self):
+            with self.lock:
+                self.calls.append("disable")
+                release.wait(2)
+                return True
+
+    dev = SlowDisable()
+    rec = Recorder(lambda: dev, poll_interval_s=0.001)
+    rec.start_pd()
+    dev.fail_next = True
+    wait_until(lambda: dev.calls == ["enable", "disable"])
+    starter = threading.Thread(target=rec.start_pd)
+    starter.start()
+    time.sleep(0.05)
+    release.set()
+    starter.join(2)
+    # The old disable went out first, so the new capture's enable is the last word.
+    assert dev.calls == ["enable", "disable", "enable"]
+    polls = len(dev.masks)
+    wait_until(lambda: len(dev.masks) > polls + 5)
+    assert rec.pd_events()["running"]
+    rec.stop_pd()
+
+
+def test_pd_capture_started_during_a_stream_keeps_the_stream_polled():
+    dev = LockingDevice()
+    rec = Recorder(lambda: dev, poll_interval_s=0.001)
+    rec.start_stream(3)
+    wait_until(lambda: len(dev.masks) >= 3)
+    rec.start_pd()
+    wait_until(lambda: dev.masks.count(ATT_ADCQUEUE | ATT_PD) >= 3)
+    status = rec.stream_status()
+    assert status["running"] and status["error"] is None
+    assert dev.graph == [("start", 3)] and dev.calls == ["enable"]
+    rec.stop_pd()
+    rec.stop_stream()
+    assert dev.graph == [("start", 3), ("stop",)]

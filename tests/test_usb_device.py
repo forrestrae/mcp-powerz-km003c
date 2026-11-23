@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 import usb.core
 
@@ -6,7 +8,7 @@ from fakes import FakeTransport, live_adc_with_tid, memory_read_replies
 from km003c_mcp.crypto import ADDR_HARDWARE_ID
 from km003c_mcp.usb_device import (
     DeviceBusyError, DeviceNotFoundError, DeviceTimeoutError, Km003cDevice, Km003cError,
-    PyUsbTransport,
+    PdMonitorNotEnabledError, PyUsbTransport,
 )
 
 HWID = bytes.fromhex("3037314b42500dff110affff")
@@ -39,6 +41,89 @@ def test_disconnect_ignores_timeout():
     t = FakeTransport([])
     Km003cDevice(t).disconnect()
     assert t.writes == [bytes.fromhex("03010000")]
+
+
+@pytest.fixture
+def no_retry_delay(monkeypatch):
+    monkeypatch.setattr(ud, "PD_MONITOR_RETRY_DELAY_S", 0)
+
+
+def test_enable_pd_monitor_answered_by_disconnect_then_accept(no_retry_delay):
+    t = FakeTransport([bytes.fromhex("05010000"), bytes.fromhex("03020000"),
+                       bytes.fromhex("05030000"), bytes.fromhex("05040000")])
+    result = Km003cDevice(t).enable_pd_monitor()
+    assert result.accepted and result.outcome == "accepted"
+    assert result.attempts == 2 and result.last_reply == "05040000"
+    assert t.writes == [bytes.fromhex("02010000"), bytes.fromhex("10020200"),
+                        bytes.fromhex("02030000"), bytes.fromhex("10040200")]
+
+
+def test_enable_pd_monitor_reject_is_not_fatal():
+    t = FakeTransport([bytes.fromhex("05010000"), bytes.fromhex("06020000")])
+    result = Km003cDevice(t).enable_pd_monitor()
+    assert not result.accepted and result.outcome == "already enabled or refused"
+    assert result.attempts == 1 and result.last_reply == "06020000"
+
+
+def test_enable_pd_monitor_never_accepted(no_retry_delay):
+    script = []
+    for tid in range(1, 11, 2):
+        script += [bytes([0x05, tid, 0, 0]), DeviceTimeoutError("no reply")]
+    t = FakeTransport(script)
+    with pytest.raises(PdMonitorNotEnabledError, match="5 attempts.*last reply none"):
+        Km003cDevice(t).enable_pd_monitor()
+    assert [w[0] for w in t.writes] == [0x02, 0x10] * 5
+
+
+def test_enable_pd_monitor_never_accepted_reports_last_reply(no_retry_delay):
+    script = []
+    for tid in range(1, 11, 2):
+        script += [bytes([0x05, tid, 0, 0]), bytes([0x03, tid + 1, 0, 0])]
+    with pytest.raises(PdMonitorNotEnabledError, match="last reply 030a0000"):
+        Km003cDevice(FakeTransport(script)).enable_pd_monitor()
+
+
+class TimedTransport(FakeTransport):
+    def __init__(self, script):
+        super().__init__(script)
+        self.read_timeouts = []
+
+    def read(self, size, timeout_ms):
+        self.read_timeouts.append(timeout_ms)
+        return super().read(size, timeout_ms)
+
+
+def test_enable_pd_monitor_bounds_how_long_it_holds_the_lock(monkeypatch):
+    t = TimedTransport([])  # the meter never answers
+    dev = Km003cDevice(t)
+    free_between_attempts = []
+
+    def sleep(_seconds):
+        # Another thread, such as a stream's poller, must be able to take the lock here.
+        got = []
+
+        def probe():
+            acquired = dev.lock.acquire(timeout=0.5)
+            if acquired:
+                dev.lock.release()
+            got.append(acquired)
+        thread = threading.Thread(target=probe)
+        thread.start()
+        thread.join()
+        free_between_attempts.append(got[0])
+    monkeypatch.setattr(ud.time, "sleep", sleep)
+    with pytest.raises(PdMonitorNotEnabledError):
+        dev.enable_pd_monitor()
+    assert free_between_attempts == [True] * 4
+    assert t.read_timeouts and max(t.read_timeouts) <= ud.PD_MONITOR_TIMEOUT_MS
+
+
+def test_disable_pd_monitor():
+    t = FakeTransport([bytes.fromhex("05010000"), bytes.fromhex("06020000")])
+    dev = Km003cDevice(t)
+    assert dev.disable_pd_monitor() is True
+    assert dev.disable_pd_monitor() is False  # Reject: already disabled
+    assert t.writes == [bytes.fromhex("11010000"), bytes.fromhex("11020000")]
 
 
 def test_get_data_skips_stale_packets():

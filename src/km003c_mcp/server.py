@@ -206,9 +206,13 @@ def build_tools(service: Km003cService) -> SimpleNamespace:
 
     @safe
     def pd_capture_start() -> dict:
-        """Start capturing USB PD traffic (messages, attach/detach) in the background."""
-        service.recorder.start_pd()
-        return {"started": True}
+        """Start capturing USB PD traffic (messages, attach/detach) in the background.
+
+        Enables the meter's PD monitor first. pd_monitor reports the outcome: accepted, or
+        "already enabled or refused" when the meter answered Reject, which does not stop capture.
+        """
+        monitor = service.recorder.start_pd()
+        return {"started": True, "pd_monitor": monitor.to_dict()}
 
     @safe
     def pd_capture_read(since: int = 0, limit: int = 100, decode: bool = True) -> dict:
