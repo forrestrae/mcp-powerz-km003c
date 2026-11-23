@@ -146,13 +146,22 @@ def test_hw_busy_error_names_the_holder(service):
     PyUsbTransport.open().close()  # free again once the holder exits
 
 
-def test_hw_trigger_open_close(tools):
+@pytest.fixture
+def trigger_tools(tools):
+    if not hasattr(tools, "trigger_raw"):
+        pytest.skip("trigger tools are not registered (KM003C_ENABLE_TRIGGER)")
+    return tools
+
+
+def test_hw_trigger_open_close(trigger_tools):
+    tools = trigger_tools
     lines = tools.trigger_raw("pd pdo")["lines"]
     assert any(line.startswith("max power") for line in lines)
     assert tools.trigger_close()["lines"] == ["ok"]
 
 
-def test_hw_trigger_and_usb_concurrently(tools):
+def test_hw_trigger_and_usb_concurrently(trigger_tools):
+    tools = trigger_tools
     tools.stream_start(rate_sps=50)
     assert "lines" in tools.trigger_raw("pd pdo")
     time.sleep(0.5)

@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 import km003c_mcp.server as srv
@@ -21,7 +23,7 @@ def make_tools(script=None, serial_replies=None, factory=None):
         trigger_factory=lambda port: TriggerPort(port, serial_factory=lambda *a, **k: fs),
         port_finder=lambda serial_number=None, override=None: "COMX",
     )
-    tools = build_tools(svc)
+    tools = build_tools(svc, enable_trigger=True)
     tools._service = svc  # test-only handle
     return tools, fs
 
@@ -227,3 +229,45 @@ def test_reopen_after_reset_skips_the_holder_lookup(monkeypatch):
     tools, _ = make_tools(factory=factory)
     assert "vbus_v" in tools.measure()
     assert lookups[0] is None and lookups[1] is not None and lookups[1]("000000") is None
+
+
+def registered_tools(enable_trigger=None):
+    tools = build_tools(Km003cService(transport_factory=lambda: FakeTransport([])),
+                        enable_trigger=enable_trigger)
+    return {tool.name for tool in asyncio.run(srv.build_server(tools).list_tools())}
+
+
+@pytest.mark.parametrize("value, present", [("1", True), ("0", False)])
+def test_trigger_flag_registers_or_hides_every_trigger_tool(monkeypatch, value, present):
+    monkeypatch.setenv("KM003C_ENABLE_TRIGGER", value)
+    names = registered_tools()
+    assert all((name in names) == present for name in srv.TRIGGER_TOOLS)
+    assert {"measure", "pd_capture_start", "device_release"} <= names
+
+
+def test_trigger_tools_follow_the_default_when_unset(monkeypatch):
+    monkeypatch.delenv("KM003C_ENABLE_TRIGGER", raising=False)
+    monkeypatch.setattr(srv, "DEFAULT_ENABLE_TRIGGER", True)
+    assert set(srv.TRIGGER_TOOLS) <= registered_tools()
+    monkeypatch.setattr(srv, "DEFAULT_ENABLE_TRIGGER", False)
+    assert not set(srv.TRIGGER_TOOLS) & registered_tools()
+
+
+def test_upstream_default_registers_trigger_tools(monkeypatch):
+    monkeypatch.delenv("KM003C_ENABLE_TRIGGER", raising=False)
+    assert srv.DEFAULT_ENABLE_TRIGGER is True
+    assert set(srv.TRIGGER_TOOLS) <= registered_tools()
+
+
+@pytest.mark.parametrize("value", ["false", "no", "off", "yes", "true", "2", " 0 "])
+def test_any_trigger_flag_but_1_hides_the_tools(monkeypatch, value):
+    # A value meant as "off" must never fall back to a default that registers the tools.
+    monkeypatch.setenv("KM003C_ENABLE_TRIGGER", value)
+    monkeypatch.setattr(srv, "DEFAULT_ENABLE_TRIGGER", True)
+    assert srv.trigger_enabled_from_env() is False
+    assert not set(srv.TRIGGER_TOOLS) & registered_tools()
+
+
+def test_trigger_tools_list_matches_the_tools():
+    names = set(vars(build_tools(Km003cService(), enable_trigger=True)))
+    assert {name for name in names if name.startswith("trigger_")} == set(srv.TRIGGER_TOOLS)

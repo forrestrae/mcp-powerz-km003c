@@ -60,6 +60,30 @@ def idle_release_from_env() -> float | None:
     return seconds
 
 
+# Unset KM003C_ENABLE_TRIGGER: True registers the trigger tools.
+DEFAULT_ENABLE_TRIGGER = True
+TRIGGER_TOOLS = ("trigger_detect", "trigger_enter", "trigger_pd_source_caps",
+                 "trigger_pd_request", "trigger_fast_charge", "trigger_reset", "trigger_close",
+                 "trigger_raw")
+
+
+def trigger_enabled_from_env() -> bool:
+    """Whether to register the trigger tools, from ``KM003C_ENABLE_TRIGGER``.
+
+    Unset or empty gives :data:`DEFAULT_ENABLE_TRIGGER`. ``1`` registers them. Any other value
+    leaves them out, so a value meant as "off", such as ``false`` or ``no``, cannot fall back
+    to a default that registers them.
+    """
+    raw = os.environ.get("KM003C_ENABLE_TRIGGER", "").strip()
+    if not raw:
+        return DEFAULT_ENABLE_TRIGGER
+    if raw == "1":
+        return True
+    if raw != "0":
+        log.warning("KM003C_ENABLE_TRIGGER=%r is not 1; the trigger tools stay off", raw)
+    return False
+
+
 def _daemon_timer(delay_s: float, fn: Callable[[], None]) -> threading.Timer:
     timer = threading.Timer(delay_s, fn)
     timer.daemon = True
@@ -334,8 +358,15 @@ class Km003cService:
         self._finish_release(device)
 
 
-def build_tools(service: Km003cService) -> SimpleNamespace:
-    """Create the tool callables; errors come back as {"error", "kind"} dicts."""
+def build_tools(service: Km003cService, enable_trigger: bool | None = None) -> SimpleNamespace:
+    """Create the tool callables; errors come back as {"error", "kind"} dicts.
+
+    The trigger tools are left out unless ``enable_trigger`` is True; None reads
+    ``KM003C_ENABLE_TRIGGER``. They make the meter a PD sink that can raise VBUS on its
+    output, so leaving them out keeps an agent from seeing or calling them.
+    """
+    if enable_trigger is None:
+        enable_trigger = trigger_enabled_from_env()
 
     def safe(fn, claims_meter: bool = False):
         @functools.wraps(fn)
@@ -529,18 +560,27 @@ def build_tools(service: Km003cService) -> SimpleNamespace:
         device_info, measure, pd_status, stream_start, stream_status, stream_samples,
         stream_stop, pd_capture_start, pd_capture_read, pd_capture_stop, device_release,
         trigger_detect, trigger_enter, trigger_pd_source_caps, trigger_pd_request,
-        trigger_fast_charge, trigger_reset, trigger_close, trigger_raw)})
+        trigger_fast_charge, trigger_reset, trigger_close, trigger_raw)
+        if enable_trigger or fn.__name__ not in TRIGGER_TOOLS})
+
+
+def build_server(tools: SimpleNamespace) -> MCPServer:
+    """Register every tool in ``tools`` on a new MCP server."""
+    triggering = hasattr(tools, "trigger_raw")
+    server = MCPServer(
+        "km003c",
+        instructions="Tools for the ChargerLab POWER-Z KM003C USB-C power meter: measurements, "
+                     "high-rate streaming, USB PD capture/decoding"
+                     + (" and fast-charge protocol triggering." if triggering else "."),
+    )
+    for tool in vars(tools).values():
+        server.tool()(tool)
+    return server
 
 
 service = Km003cService()
 tools = build_tools(service)
-mcp = MCPServer(
-    "km003c",
-    instructions="Tools for the ChargerLab POWER-Z KM003C USB-C power meter: measurements, "
-                 "high-rate streaming, USB PD capture/decoding and fast-charge protocol triggering.",
-)
-for _tool in vars(tools).values():
-    mcp.tool()(_tool)
+mcp = build_server(tools)
 
 
 def main() -> None:
