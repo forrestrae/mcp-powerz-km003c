@@ -6,7 +6,9 @@ begun, so a script can start it in the background and wait for that line.
 
 Exit codes: 0 success; 1 a capture that ended with an error, or a meter error; 2 an
 unreadable file or a bad argument; 3 ``record`` reached its timeout before its stop
-condition (``--stop-on`` or ``--stop-after-messages``) was met.
+condition (``--stop-on`` or ``--stop-after-messages``) was met; 130 ``record`` was
+interrupted before capturing began. Ctrl-C or SIGTERM during a capture stops it with
+footer reason ``manual`` and exits as for any other stop.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from . import capture_read
 from .capture import STOP_ON
 
 EXIT_NOT_MET = 3
+EXIT_INTERRUPTED = 130  # interrupted before capturing began
 
 
 def _summary_text(s: dict) -> str:
@@ -48,38 +51,56 @@ def _record(args: argparse.Namespace) -> int:
     if provenance is not None and not isinstance(provenance, dict):
         raise ValueError("--provenance must be a JSON object")
 
-    def interrupted(signum, frame):
-        raise KeyboardInterrupt
+    # The first Ctrl-C or SIGTERM stops the capture; later ones are ignored while the footer
+    # is written, the meter released, and the summary printed.
+    stopping = {"now": False}
 
-    previous_handler = signal.signal(signal.SIGTERM, interrupted)
-    service = Km003cService(idle_release_s=0)
-    recorder = service.recorder
+    def interrupted(signum, frame):
+        if not stopping["now"]:
+            stopping["now"] = True
+            raise KeyboardInterrupt
+
+    previous = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
-        try:
-            monitor = recorder.start_pd(
-                args.path, args.label, provenance, stop_on=args.stop_on,
-                stop_after_messages=args.stop_after_messages, settle_ms=args.settle_ms,
-                timeout_s=args.timeout, status_interval_ms=args.status_interval_ms)
-        except Exception:
-            if recorder.capture_path is not None:
-                print(f"capture file {recorder.capture_path}", file=sys.stderr, flush=True)
-            raise
+        return _record_with(args, provenance, Km003cService, stopping)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def _record_with(args, provenance, service_class, stopping) -> int:
+    service = service_class(idle_release_s=0)
+    recorder = service.recorder
+    started = False
+    try:
+        monitor = recorder.start_pd(
+            args.path, args.label, provenance, stop_on=args.stop_on,
+            stop_after_messages=args.stop_after_messages, settle_ms=args.settle_ms,
+            timeout_s=args.timeout, status_interval_ms=args.status_interval_ms)
+        started = True
         print(f"capturing {recorder.capture_path}", flush=True)
         print(f"pd_monitor {monitor.outcome}; stop_on {args.stop_on}; timeout {args.timeout:g} s; "
               "Ctrl-C stops", flush=True)
-        try:
-            while not recorder.wait_pd(0.5):
-                pass
-        except KeyboardInterrupt:
-            recorder.stop_pd()
+        while not recorder.wait_pd(0.5):
+            pass
+    except KeyboardInterrupt:
+        stopping["now"] = True
+        print("stopping: interrupted", file=sys.stderr, flush=True)
+    except BaseException:
+        stopping["now"] = True
+        if recorder.capture_path is not None:
+            print(f"capture file {recorder.capture_path}", file=sys.stderr, flush=True)
+        raise
     finally:
-        service.shutdown()
-        signal.signal(signal.SIGTERM, previous_handler)
+        stopping["now"] = True
+        service.shutdown()  # stops a running capture with reason manual and releases the meter
     path = recorder.capture_path
     if path is None:
-        return 1
+        return EXIT_INTERRUPTED
     summary = capture_read.read(path, "summary")
     print(json.dumps(summary, indent=1) if args.json else _summary_text(summary), flush=True)
+    if not started:
+        return EXIT_INTERRUPTED
     if summary.get("reason") == "error":
         return 1
     if summary.get("reason") == "timeout" and (args.stop_on != "none"

@@ -125,6 +125,10 @@ writes an annotation, such as "stimulus GSrC sent". `pd_capture_stop()` stops th
 and returns its summary. A capture holds its claim on the meter until it stops; reading a
 file never claims the meter.
 
+When the server receives SIGTERM, it stops a running capture with footer reason `manual`,
+stops a running stream, releases the meter, and exits with status 0. It exits after 10 s
+even if a cleanup step hangs.
+
 ### Record types
 
 | `type` | Fields |
@@ -196,8 +200,9 @@ km003c-capture record --stop-on contract --timeout 120 --label "cold attach" cap
 `record` takes the same options as `pd_capture_start` (`--stop-on`, `--stop-after-messages`,
 `--settle-ms`, `--timeout`, `--status-interval-ms`, `--label`, `--provenance`). It prints
 `capturing <path>` once capturing has begun, so a script can start it in the background and
-prompt for the stimulus after that line. It prints the summary when the capture stops;
-Ctrl-C or SIGTERM stops it with reason `manual`.
+prompt for the stimulus after that line. It prints the summary when the capture stops.
+The first Ctrl-C or SIGTERM stops the capture with reason `manual`, and further ones are
+ignored until the footer is written and the summary printed.
 
 | Exit code | Meaning |
 |---|---|
@@ -205,6 +210,7 @@ Ctrl-C or SIGTERM stops it with reason `manual`.
 | 1 | The capture ended with an error, or the meter could not be used |
 | 2 | An unreadable file or a bad argument |
 | 3 | `record` reached `--timeout` before `--stop-on` or `--stop-after-messages` was met |
+| 130 | `record` was interrupted before capturing began |
 
 ## Tests
 
