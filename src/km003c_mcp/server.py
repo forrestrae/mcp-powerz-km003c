@@ -474,16 +474,19 @@ def build_tools(service: Km003cService, enable_trigger: bool | None = None) -> S
         """Stop the stream and return its statistics."""
         return service.recorder.stop_stream().to_dict()
 
-    def read_capture(path, *args) -> dict:
-        """Read a capture file; when it is this session's capture, say whether it still runs."""
-        out = capture_read.read(path, *args)
-        state = service.recorder.pd_capture_state()
-        if state["path"] == out["path"]:
-            out["running"] = state["running"]
-        return out
+    def read_capture(path, *args, extra: dict | None = None) -> dict:
+        """Read a capture file; when it is this session's capture, say whether it still runs.
 
-    def capture_summary(path) -> dict:
-        return read_capture(path, "summary")
+        The added fields count toward the summary's size bound.
+        """
+        extra = dict(extra or {})
+        state = service.recorder.pd_capture_state()
+        if state["path"] is not None and state["path"] == str(capture_read.resolve_path(path)):
+            extra["running"] = state["running"]
+        return capture_read.read(path, *args, extra=extra)
+
+    def capture_summary(path, extra: dict | None = None) -> dict:
+        return read_capture(path, "summary", extra=extra)
 
     def current_capture() -> str:
         path = service.recorder.capture_path
@@ -539,7 +542,7 @@ def build_tools(service: Km003cService, enable_trigger: bool | None = None) -> S
         """Stop the running PD capture and return its summary (stopped is False when none ran;
         the summary is then the last capture's)."""
         stopped = service.recorder.stop_pd() is not None
-        return {"stopped": stopped, **capture_summary(current_capture())}
+        return capture_summary(current_capture(), extra={"stopped": stopped})
 
     @safe
     def pd_capture_read(path: str | None = None,
