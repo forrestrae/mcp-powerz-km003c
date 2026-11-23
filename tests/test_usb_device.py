@@ -8,7 +8,7 @@ from fakes import FakeTransport, live_adc_with_tid, memory_read_replies
 from km003c_mcp.crypto import ADDR_HARDWARE_ID
 from km003c_mcp.usb_device import (
     DeviceBusyError, DeviceNotFoundError, DeviceTimeoutError, Km003cDevice, Km003cError,
-    PdMonitorNotEnabledError, PyUsbTransport,
+    MeterLaggingError, PdMonitorNotEnabledError, PyUsbTransport,
 )
 
 HWID = bytes.fromhex("3037314b42500dff110affff")
@@ -18,6 +18,42 @@ def test_connect_retries_after_disconnect_reply():
     t = FakeTransport([bytes.fromhex("03010000"), bytes.fromhex("05020000")])
     Km003cDevice(t).connect()
     assert [w[0] for w in t.writes] == [0x02, 0x02]
+
+
+def test_connect_timeouts_with_late_replies_mean_a_lagging_meter():
+    timeout = DeviceTimeoutError("no reply")
+    # Each read returns the reply to the previous Connect, so no attempt sees its own.
+    t = FakeTransport([timeout, bytes.fromhex("05010000"), timeout,
+                       bytes.fromhex("05020000"), timeout])
+    with pytest.raises(MeterLaggingError, match="2 replies to earlier requests"):
+        Km003cDevice(t).connect()
+
+
+def test_connect_ignores_packets_that_are_not_late_connect_replies():
+    timeout = DeviceTimeoutError("no reply")
+    # The meter's Disconnect packet carries TID 0x11 whatever was sent; it is not lag.
+    t = FakeTransport([timeout, bytes.fromhex("03110000"), timeout,
+                       bytes.fromhex("41990000"), timeout])
+    with pytest.raises(Km003cError, match="cannot connect") as info:
+        Km003cDevice(t).connect()
+    assert not isinstance(info.value, MeterLaggingError)
+
+
+def test_connect_counts_only_replies_to_its_own_earlier_attempts():
+    timeout = DeviceTimeoutError("no reply")
+    dev = Km003cDevice(FakeTransport([bytes.fromhex("05010000")]))
+    dev.connect()  # TID 1, accepted
+    # A late reply to that earlier call's TID 1 is not a late reply to this call.
+    dev.transport = FakeTransport([timeout, bytes.fromhex("05010000"), timeout, timeout])
+    with pytest.raises(Km003cError) as info:
+        dev.connect()
+    assert not isinstance(info.value, MeterLaggingError)
+
+
+def test_connect_timeouts_without_late_replies_are_a_plain_failure():
+    with pytest.raises(Km003cError, match="cannot connect") as info:
+        Km003cDevice(FakeTransport([])).connect()
+    assert not isinstance(info.value, MeterLaggingError)
 
 
 UNMATCHED = bytes.fromhex("41990000")
@@ -198,6 +234,20 @@ def disposed(monkeypatch):
     devices = []
     monkeypatch.setattr(usb.util, "dispose_resources", devices.append)
     return devices
+
+
+class ResettableUsb:
+    def __init__(self):
+        self.calls = []
+
+    def reset(self):
+        self.calls.append("reset")
+
+
+def test_transport_reset_resets_and_disposes(disposed):
+    dev = ResettableUsb()
+    PyUsbTransport(dev, "A").reset()
+    assert dev.calls == ["reset"] and disposed == [dev]
 
 
 def test_open_busy_maps_to_device_busy(monkeypatch, disposed):

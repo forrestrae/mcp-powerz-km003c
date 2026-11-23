@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import atexit
 import functools
+import inspect
+import logging
 import threading
 import time
 from dataclasses import asdict
@@ -18,11 +20,18 @@ from .recorder import Recorder
 from .trigger import (
     TriggerPort, entry_command, fast_charge_command, find_trigger_port, pd_request_command,
 )
-from .usb_device import Km003cDevice, Km003cError, PyUsbTransport, TransportError
+from .usb_device import (
+    Km003cDevice, Km003cError, MeterLaggingError, PyUsbTransport, TransportError,
+)
+
+log = logging.getLogger(__name__)
 
 RATE_INDEX = {2: 0, 10: 1, 50: 2, 1000: 3}
 VBUS_WARNING = ("Makes the attached charger raise VBUS on the meter's output; "
                 "disconnect sensitive loads first.")
+# After a USB reset the meter re-enumerates; reopening is retried this often.
+RESET_REOPEN_ATTEMPTS = 10
+RESET_REOPEN_DELAY_S = 0.3
 
 
 class Km003cService:
@@ -42,17 +51,65 @@ class Km003cService:
     def device(self) -> Km003cDevice:
         with self._lock:
             if self._device is None:
-                transport = self._transport_factory()
-                device = Km003cDevice(transport)
+                device = self._open_device()
                 try:
-                    device.connect()
                     # A previous session may have left the firmware streaming; Reject is fine.
                     device.stop_graph()
                 except Km003cError:
-                    transport.close()
+                    device.transport.close()
                     raise
                 self._device = device
             return self._device
+
+    def _open_device(self) -> Km003cDevice:
+        """Claim the meter and Connect; reset the USB device once if the meter answers late."""
+        transport = self._transport_factory()
+        device = Km003cDevice(transport)
+        try:
+            device.connect()
+            return device
+        except MeterLaggingError as exc:
+            log.warning("%s; resetting the USB device", exc)
+            transport.reset()
+        except Km003cError:
+            transport.close()
+            raise
+        transport = self._reopen_after_reset()
+        device = Km003cDevice(transport)
+        try:
+            device.connect()
+        except Km003cError as exc:
+            transport.close()
+            raise Km003cError(
+                "the KM003C answers late and still does after a USB reset "
+                f"({exc}); unplug and replug the meter") from exc
+        return device
+
+    def _reopen_after_reset(self):
+        """Open the meter again while it re-enumerates after a reset.
+
+        A claim refused during re-enumeration is expected, so the holder lookup (``ioreg`` on
+        macOS) is skipped here when the factory takes one; the loop then lasts at most
+        ``RESET_REOPEN_ATTEMPTS * RESET_REOPEN_DELAY_S`` plus the open calls.
+        """
+        factory = self._transport_factory
+        try:
+            takes_lookup = "holder_lookup" in inspect.signature(factory).parameters
+        except (TypeError, ValueError):
+            takes_lookup = False
+        if takes_lookup:
+            factory = functools.partial(factory, holder_lookup=lambda serial: None)
+        last: Exception | None = None
+        for _ in range(RESET_REOPEN_ATTEMPTS):
+            time.sleep(RESET_REOPEN_DELAY_S)
+            try:
+                return factory()
+            except Km003cError as exc:
+                last = exc
+        waited = RESET_REOPEN_ATTEMPTS * RESET_REOPEN_DELAY_S
+        raise Km003cError(
+            f"the KM003C did not come back within {waited:g} s after a USB reset ({last}); "
+            "unplug and replug the meter")
 
     def invalidate_device(self) -> None:
         """Drop a broken USB session; the next call opens a fresh one."""
