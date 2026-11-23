@@ -3,6 +3,10 @@
 ``summarize`` and ``facts`` read files only and never open the meter. ``record`` claims the
 meter for the length of the capture and prints ``capturing <path>`` once capturing has
 begun, so a script can start it in the background and wait for that line.
+
+Exit codes: 0 success; 1 a capture that ended with an error, or a meter error; 2 an
+unreadable file or a bad argument; 3 ``record`` reached its timeout before its stop
+condition (``--stop-on`` or ``--stop-after-messages``) was met.
 """
 
 from __future__ import annotations
@@ -14,6 +18,8 @@ import sys
 
 from . import capture_read
 from .capture import STOP_ON
+
+EXIT_NOT_MET = 3
 
 
 def _summary_text(s: dict) -> str:
@@ -74,14 +80,21 @@ def _record(args: argparse.Namespace) -> int:
         return 1
     summary = capture_read.read(path, "summary")
     print(json.dumps(summary, indent=1) if args.json else _summary_text(summary), flush=True)
-    return 1 if summary.get("reason") == "error" else 0
+    if summary.get("reason") == "error":
+        return 1
+    if summary.get("reason") == "timeout" and (args.stop_on != "none"
+                                                or args.stop_after_messages is not None):
+        return EXIT_NOT_MET
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="km003c-capture",
         description="Record USB PD captures from a ChargerLab POWER-Z KM003C, or read saved "
-                    "capture files (summarize and facts never touch the meter).")
+                    "capture files (summarize and facts never touch the meter).",
+        epilog="Exit codes: 0 success; 1 the capture ended with an error; 2 unreadable file "
+               "or bad argument; 3 record timed out before its stop condition was met.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     rec = sub.add_parser("record", help="capture PD traffic to a new capture file")

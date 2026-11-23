@@ -190,8 +190,14 @@ km003c-capture record --stop-on contract --timeout 120 --label "cold attach" cap
 `--settle-ms`, `--timeout`, `--status-interval-ms`, `--label`, `--provenance`). It prints
 `capturing <path>` once capturing has begun, so a script can start it in the background and
 prompt for the stimulus after that line. It prints the summary when the capture stops;
-Ctrl-C or SIGTERM stops it with reason `manual`. It exits 0, or 1 when the capture ended
-with an error.
+Ctrl-C or SIGTERM stops it with reason `manual`.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Success: the capture stopped on its condition, by hand, or at the timeout when it had no condition |
+| 1 | The capture ended with an error, or the meter could not be used |
+| 2 | An unreadable file or a bad argument |
+| 3 | `record` reached `--timeout` before `--stop-on` or `--stop-after-messages` was met |
 
 ## Tests
 
