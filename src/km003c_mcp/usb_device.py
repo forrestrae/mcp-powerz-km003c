@@ -219,8 +219,12 @@ class Km003cDevice:
 
     def disconnect(self) -> None:
         with self.lock:
+            tid = self._next_tid()
+            # Firmware 2.0.0 answers Disconnect with a Disconnect packet whose TID is fixed at
+            # 0x11 (03 11 00 00), so a same-TID match alone would wait out the full timeout.
             try:
-                self._control(CMD_DISCONNECT)
+                self._transact(encode_ctrl(CMD_DISCONNECT, tid),
+                               lambda r: r[1] == tid or _cmd(r) == CMD_DISCONNECT)
             except DeviceTimeoutError:
                 pass
 

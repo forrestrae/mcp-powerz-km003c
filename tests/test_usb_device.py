@@ -18,6 +18,29 @@ def test_connect_retries_after_disconnect_reply():
     assert [w[0] for w in t.writes] == [0x02, 0x02]
 
 
+UNMATCHED = bytes.fromhex("41990000")
+
+
+def test_disconnect_matches_reply_by_type():
+    # Firmware 2.0.0 answers Disconnect with 03 11 00 00 whatever TID the request carried.
+    t = FakeTransport([bytes.fromhex("03110000"), UNMATCHED])
+    Km003cDevice(t).disconnect()
+    assert t.writes == [bytes.fromhex("03010000")]
+    assert t.script == [UNMATCHED]
+
+
+def test_disconnect_accepts_same_tid_reply():
+    t = FakeTransport([bytes.fromhex("05010000"), UNMATCHED])
+    Km003cDevice(t).disconnect()
+    assert t.script == [UNMATCHED]
+
+
+def test_disconnect_ignores_timeout():
+    t = FakeTransport([])
+    Km003cDevice(t).disconnect()
+    assert t.writes == [bytes.fromhex("03010000")]
+
+
 def test_get_data_skips_stale_packets():
     t = FakeTransport([bytes.fromhex("05090000"), live_adc_with_tid(1)])
     r = Km003cDevice(t).read_adc()
