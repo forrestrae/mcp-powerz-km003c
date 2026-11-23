@@ -217,3 +217,13 @@ def test_hw_cold_attach_stops_on_contract(tools):
     assert recs[0]["meter"]["fw_version"] == firmware
     assert recs[-1]["type"] == "footer" and recs[-1]["reason"] == "contract"
     assert summary["contract"] is not None and summary["warnings"] == []
+    # Every event's 32-bit timestamp lies within a few poll periods before the uptime in its
+    # poll's status block, which the writer puts first for any poll that carries events.
+    window_ms = 4 * recs[0]["server"]["poll_ms"] + 50
+    status = None
+    for r in recs:
+        if r["type"] == "status":
+            status = r
+        elif r["type"] in ("pd", "conn"):
+            lag = status["t_meter_ms"] - r["t_meter_ms"]
+            assert 0 <= lag <= window_ms, (r, status)
