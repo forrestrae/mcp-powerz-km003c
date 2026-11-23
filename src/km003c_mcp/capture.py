@@ -248,6 +248,8 @@ class CaptureSession:
         self.settle_until: int | None = None
         self.reason: str | None = None
         self.header_written = False
+        # Why the last payload passed to ingest() failed to parse, or None.
+        self.parse_error: str | None = None
         self._last_status_t: int | None = None
 
     @property
@@ -283,6 +285,7 @@ class CaptureSession:
         """
         t_host = self._wall()
         split = split_pd(payload)
+        self.parse_error = split.error
         meter_t = None
         status = None
         if len(split.status_raw) == PD_STATUS_SIZE:
