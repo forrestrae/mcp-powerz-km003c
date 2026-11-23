@@ -440,3 +440,32 @@ def test_summary_bound_holds_with_oversized_fields(tmp_path, body):
 def test_summary_with_no_lines_is_not_truncated():
     out = cr.summary(cr.Capture(GOLDEN, HEADER, None, [], []))
     assert out["lines"] == [] and out["truncated"] is False
+
+
+# --- facts bound ----------------------------------------------------------------------------
+
+def test_facts_stay_within_their_bound_and_keep_the_contract(tmp_path):
+    golden = records(GOLDEN)
+    caps = next(r for r in golden if r.get("msg") == "Source_Capabilities")
+    body = [r for r in golden[1:-1]]
+    # 50 more Source_Capabilities and Requests that never complete, before the real ones.
+    noise = []
+    for k in range(50):  # each acknowledged, so none is a retransmission
+        noise += [{**caps, "i": 1000 + 4 * k, "t_meter_ms": 100 + 4 * k},
+                  _pd(1001 + 4 * k, 101 + 4 * k, "4100"),
+                  _pd(1002 + 4 * k, 102 + 4 * k, "82102cb18441"),
+                  _pd(1003 + 4 * k, 103 + 4 * k, "6101")]
+    path = _write(tmp_path, [golden[0], *noise, *body, golden[-1]])
+    f = cr.read(path, "facts")
+    assert size(f) <= cr.FACTS_MAX_BYTES and f["truncated"] is True
+    assert f["omitted"]["source_capabilities"] >= 40 and f["omitted"]["requests"] >= 40
+    contract = f["requests"][f["contract"]["request_index"]]
+    assert contract["ps_rdy_t"] == 14637780 and contract["rdo"]["hex"] == "4184b12c"
+    assert any(c["i"] == contract["source_capabilities_i"] for c in f["source_capabilities"])
+    # Both SOP and SOP' identity ACKs survive.
+    assert set(f["discover_identity_acks"]) == {"SOP", "SOP'"}
+
+
+def test_facts_of_a_short_capture_omit_nothing():
+    f = cr.read(GOLDEN, "facts")
+    assert f["truncated"] is False and set(f["omitted"].values()) == {0}
