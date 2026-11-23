@@ -79,6 +79,46 @@ def test_hw_pd_monitor_enable(service, tools):
     assert tools.pd_capture_stop()["stopped"]
 
 
+def test_hw_claim_and_release_10_times(service):
+    service.release()  # free the module session's claim; later tests reopen on demand
+    svc = Km003cService(idle_release_s=0)
+    release_s = []
+    devices = set()
+    try:
+        for _ in range(10):
+            lease = svc.lease("hw test")
+            device = svc.device()
+            assert 3.0 < device.read_adc().vdd_v < 3.6
+            devices.add(id(device))
+            started = time.monotonic()
+            lease.release()  # the last lease: releases at once
+            release_s.append(time.monotonic() - started)
+            assert not svc.claimed
+    finally:
+        svc.shutdown()
+    print(f"release ms: {[round(t * 1000) for t in release_s]}")
+    assert len(devices) == 10  # every cycle opened a new session
+    # Disconnect is matched by type, so a release no longer waits out the 2 s timeout.
+    assert max(release_s) < 0.5
+
+
+def test_hw_pd_capture_idle_2s(service):
+    service.release()
+    svc = Km003cService(idle_release_s=0)
+    tools = build_tools(svc)
+    try:
+        assert tools.pd_capture_start()["started"]
+        time.sleep(2)
+        page = tools.pd_capture_read()
+        assert page["running"] and page["error"] is None
+        assert svc.claimed  # the capture's lease keeps the meter claimed
+        assert tools.pd_capture_stop()["stopped"]
+        assert tools.pd_capture_read()["error"] is None
+        assert not svc.claimed
+    finally:
+        svc.shutdown()
+
+
 HOLDER = """
 import sys
 from km003c_mcp.usb_device import PyUsbTransport
