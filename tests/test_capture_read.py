@@ -455,3 +455,39 @@ def test_facts_stay_within_their_bound_and_keep_the_contract(tmp_path):
 def test_facts_of_a_short_capture_omit_nothing():
     f = cr.read(GOLDEN, "facts")
     assert f["truncated"] is False and set(f["omitted"].values()) == {0}
+
+
+# --- a real cold attach past 2^24 ms of uptime ----------------------------------------------
+
+COLD = GOLDEN.parent / "cold_attach_fw2.0.0.jsonl"
+
+
+def test_cold_attach_summary_and_facts():
+    s = cr.read(COLD)
+    assert s["reason"] == "contract" and s["warnings"] == [] and s["meter_fw"] == "2.0.0"
+    assert s["contract"] == {"t_ps_rdy": 40104470, "rdo": "4184b12c", "pdo": "000641d6",
+                             "text": "pos 4, 3.0 A of 20.0 V 4.7 A"}
+    f = cr.read(COLD, "facts")
+    contract = f["requests"][f["contract"]["request_index"]]
+    assert contract["rdo"]["object_position"] == 4 and contract["rdo"]["hex"] == "4184b12c"
+    assert contract["ps_rdy_t"] == 40104470
+    acks = f["discover_identity_acks"]
+    assert set(acks) == {"SOP", "SOP'"}
+    assert acks["SOP'"]["cable"][0]["vdos"][0]["decoded"]["vid"] == "0x20c2"
+    assert acks["SOP"]["sink/ufp"][0]["vdos"][0]["decoded"]["vid"] == "0x0451"
+
+
+def test_cold_attach_timestamps_are_32_bit_and_match_the_poll():
+    from km003c_mcp.protocol import split_pd
+    recs = records(COLD)
+    events = [r for r in recs if r["type"] in ("pd", "conn")]
+    assert {r["type"] for r in events} == {"pd", "conn"}
+    status = None
+    for r in recs:
+        if r["type"] == "status":
+            status = r
+        elif r["type"] in ("pd", "conn"):
+            # Reparse each raw event behind its poll's status block: bytes 1 to 4 are a u32.
+            (event,) = split_pd(bytes.fromhex(status["raw"] + r["raw_event"])).events
+            assert event.timestamp_ms == r["t_meter_ms"] > 1 << 24
+            assert 0 <= status["t_meter_ms"] - r["t_meter_ms"] < 1000
