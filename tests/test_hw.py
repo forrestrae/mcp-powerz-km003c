@@ -1,4 +1,8 @@
-"""Hardware tests against a real KM003C. Run with KM003C_HW=1 and the POWER-Z PC software closed."""
+"""Hardware tests against a real KM003C. Run with KM003C_HW=1 and the POWER-Z PC software closed.
+
+Tests that need a person to plug cables also need KM003C_HW_INTERACTIVE=1; they prompt on the
+terminal (/dev/tty), so they work under pytest's output capture.
+"""
 
 import json
 import os
@@ -181,3 +185,35 @@ def test_hw_trigger_and_usb_concurrently(trigger_tools):
     assert tools.stream_status()["error"] is None
     tools.stream_stop()
     tools.trigger_close()
+
+
+def test_hw_capture_stops_on_timeout(tools):
+    started = tools.pd_capture_start(stop_on="contract", timeout_s=1)
+    summary = tools.pd_capture_wait(timeout_s=5)
+    assert summary["running"] is False and summary["reason"] == "timeout"
+    assert read_records(started["path"])[-1]["reason"] == "timeout"
+
+
+def prompt(text: str, wait_for_enter: bool = True) -> None:
+    with open("/dev/tty", "r+") as tty:
+        tty.write(f"\n>>> {text}" + (" " if wait_for_enter else "\n"))
+        tty.flush()
+        if wait_for_enter:
+            tty.readline()
+
+
+@pytest.mark.skipif(os.environ.get("KM003C_HW_INTERACTIVE") != "1",
+                    reason="set KM003C_HW_INTERACTIVE=1; needs a cold attach by a person")
+def test_hw_cold_attach_stops_on_contract(tools):
+    firmware = tools.device_info()["fw_version"]
+    prompt("Unplug the meter from both the charger and the sink, then press Enter")
+    started = tools.pd_capture_start(label="hw cold attach", stop_on="contract", timeout_s=120,
+                                     provenance={"test": "test_hw_cold_attach_stops_on_contract"})
+    assert started["started"], started
+    prompt("Plug the meter into the sink, then the charger into the meter", wait_for_enter=False)
+    summary = tools.pd_capture_wait(timeout_s=130)
+    print(json.dumps(summary, indent=1))
+    recs = read_records(started["path"])
+    assert recs[0]["meter"]["fw_version"] == firmware
+    assert recs[-1]["type"] == "footer" and recs[-1]["reason"] == "contract"
+    assert summary["contract"] is not None and summary["warnings"] == []
