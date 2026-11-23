@@ -1,0 +1,13 @@
+#!/bin/sh
+# Agents never push. A push from an agent shell is recognised by its environment.
+for var in CLAUDECODE CODEX_THREAD_ID CODEX_SESSION_ID CODEX_TOOL_CALL_ID CODEX_SANDBOX; do
+    if [ -n "$(printenv "$var")" ]; then
+        echo "pre-push: refused, $var is set, so this is an agent shell. Agents never push; the human pushes." >&2
+        exit 1
+    fi
+done
+if [ "$(printenv WORKFLOW_AGENT)" = "1" ]; then
+    echo "pre-push: refused, WORKFLOW_AGENT=1 marks an agent shell. Agents never push; the human pushes." >&2
+    exit 1
+fi
+exit 0
