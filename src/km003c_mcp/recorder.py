@@ -17,8 +17,8 @@ from typing import Callable
 
 from .pd import PdDecoder
 from .protocol import (
-    ATT_ADCQUEUE, ATT_PD, GRAPH_RATES_SPS, AdcQueueSample, PdEventStream, parse_adcqueue,
-    parse_pd, sequence_step,
+    ATT_ADCQUEUE, ATT_PD, GRAPH_RATES_SPS, AdcQueueSample, PdEventStream, PdStatus,
+    parse_adcqueue, parse_pd, sequence_step,
 )
 from .usb_device import Km003cDevice, Km003cError, PdMonitorEnable, TransportError
 
@@ -195,6 +195,8 @@ class Recorder:
         # cleanup compares them to skip commands that would hit a newer stream or capture.
         self._stream_gen = 0
         self._pd_gen = 0
+        # The latest PD status block the capture received, and when (time.monotonic()).
+        self._pd_status: tuple[PdStatus, float] | None = None
 
     # --- lifecycle -------------------------------------------------------------------
 
@@ -377,7 +379,9 @@ class Recorder:
     def _ingest_pd(self, payload: bytes) -> None:
         parsed = parse_pd(payload)
         if not isinstance(parsed, PdEventStream):
+            self._pd_status = (parsed, time.monotonic())
             return
+        self._pd_status = (parsed.preamble, time.monotonic())
         for event in parsed.events:
             self._pd_events.append({
                 "index": len(self._pd_events),
@@ -410,6 +414,7 @@ class Recorder:
             self._pd_events = []
             self._pd_decoder = PdDecoder()
             self._pd_monitor = monitor
+            self._pd_status = None
             previous, self._pd_lease = self._pd_lease, lease
             self._ensure_thread_locked()
         if previous is not None:
@@ -435,6 +440,24 @@ class Recorder:
         finally:
             if lease is not None:
                 lease.release()
+
+    def latest_pd_status(self, wait_s: float = 0.0) -> tuple[PdStatus, float] | None:
+        """The capture's latest PD status block and its age in seconds.
+
+        Waits up to ``wait_s`` for the first block after a start. Returns None when no capture
+        runs or no block arrived in time.
+        """
+        deadline = time.monotonic() + wait_s
+        while True:
+            with self._state:
+                if not self._pd_active:
+                    return None
+                if self._pd_status is not None:
+                    status, received = self._pd_status
+                    return status, time.monotonic() - received
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.01)
 
     @property
     def pd_monitor(self) -> PdMonitorEnable | None:

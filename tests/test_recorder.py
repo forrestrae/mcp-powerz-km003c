@@ -477,3 +477,25 @@ def test_stop_stream_releases_its_lease_when_the_link_fails():
     with pytest.raises(TransportError):
         rec.stop_stream()
     assert [e[0] for e in leases.events] == ["take", "release"]
+
+
+def test_capture_keeps_the_latest_status_block():
+    dev = FakeDevice([[LogicalPacket(ATT_PD, False, 0, PD_STREAM)]])
+    rec = Recorder(lambda: dev, poll_interval_s=0.001)
+    assert rec.latest_pd_status() is None
+    rec.start_pd()
+    wait_until(lambda: rec.pd_events()["total"] == 3)
+    status, age_s = rec.latest_pd_status()
+    assert status.timestamp_ms == 0 and 0 <= age_s < 1
+    rec.stop_pd()
+    assert rec.latest_pd_status() is None
+
+
+def test_latest_status_waits_for_the_first_block():
+    dev = FakeDevice()
+    rec = Recorder(lambda: dev, poll_interval_s=0.001)
+    rec.start_pd()
+    started = time.monotonic()
+    assert rec.latest_pd_status(wait_s=0.05) is None
+    assert time.monotonic() - started >= 0.05
+    rec.stop_pd()

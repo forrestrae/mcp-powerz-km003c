@@ -50,13 +50,15 @@ class MeterFake:
 
     Each request queues its reply when written: Accept for Connect, StartGraph and the PD
     monitor commands, Reject for StopGraph, the live ADC block or an empty PutData for
-    GetData, and ``03 11 00 00`` for Disconnect. ``hold_disconnect`` is an Event the
-    Disconnect reply waits for. ``on_close`` runs when the session is released.
+    GetData, and ``03 11 00 00`` for Disconnect. ``pd_status`` (a 12-byte status block) is
+    returned for a GetData that asks for the PD attribute. ``hold_disconnect`` is an Event
+    the Disconnect reply waits for. ``on_close`` runs when the session is released.
     """
 
     def __init__(self, serial_number="TEST", hold_disconnect: threading.Event | None = None,
-                 on_close=None):
+                 on_close=None, pd_status: bytes | None = None):
         self.serial_number = serial_number
+        self.pd_status = pd_status
         self.hold_disconnect = hold_disconnect
         self.on_close = on_close
         self.writes: list[bytes] = []
@@ -86,6 +88,9 @@ class MeterFake:
             reply = bytes.fromhex("03110000")
         elif cmd == p.CMD_GET_DATA and attribute & p.ATT_ADC:
             reply = live_adc_with_tid(tid)
+        elif cmd == p.CMD_GET_DATA and attribute & p.ATT_PD and self.pd_status is not None:
+            ext = struct.pack("<I", p.ATT_PD | (len(self.pd_status) << 22))
+            reply = bytes([p.CMD_PUT_DATA, tid, 0, 0]) + ext + self.pd_status
         elif cmd == p.CMD_GET_DATA:
             reply = bytes([p.CMD_PUT_DATA, tid, 0, 0])
         else:
