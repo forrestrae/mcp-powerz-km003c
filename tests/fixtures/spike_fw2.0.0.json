@@ -1,5 +1,5 @@
 {
-"source": "Phase 1 spike, KM003C serial 053893, firmware 2.0.0, Apple 140 W charger into the TPS25751 board (sink); raw PdPacket attribute payloads, one per GetData poll, in order",
+"source": "Phase 1 spike, KM003C serial 053893, firmware 2.0.0, Apple 140 W charger into a USB PD sink board; raw PdPacket attribute payloads, one per GetData poll, in order",
 "s3": {
 "note": "S3, 15 ms poll, polls 960 to 1190 of 1288 (cold attach, negotiation, Discover Identity)",
 "payloads": [
