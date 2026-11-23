@@ -18,6 +18,11 @@ MODES = ("summary", "messages", "facts", "full")
 SUMMARY_MAX_BYTES = 2048
 DEFAULT_LIMITS = {"messages": 50, "full": 20}
 MAX_LIMIT = 500
+# A capture of a long session is a few MB; refuse to load anything far larger into memory.
+MAX_FILE_BYTES = 64 * 1024 * 1024
+# Per-entry caps in summary, messages and full output; a longer value is cut and says so.
+MAX_TEXT_CHARS = 200
+MAX_HEX_CHARS = 160
 # VBUS moving less than this across the capture counts as flat for the sanity rules.
 VBUS_FLAT_MV = 500
 _SOP_CODES = {name.lower(): code for code, name in SOP_NAMES.items()}
@@ -78,10 +83,16 @@ def load_capture(path: str | Path) -> Capture:
     ``km003c-capture`` file this reader understands.
     """
     p = resolve_path(path)
+    if not p.is_file():
+        raise ValueError(f"{p} is not a regular file" if p.exists() else f"no such file: {p}")
+    size = p.stat().st_size
+    if size > MAX_FILE_BYTES:
+        raise ValueError(f"{p} is {size} bytes; this reader loads at most {MAX_FILE_BYTES} "
+                         "bytes (split the capture or read it with another tool)")
     records: list[dict] = []
     problems: list[str] = []
-    with open(p, encoding="utf-8") as f:
-        lines = f.read().split("\n")
+    with open(p, encoding="utf-8", errors="replace") as f:
+        lines = f.read(MAX_FILE_BYTES + 1).split("\n")
     if lines and lines[-1] == "":
         lines.pop()
     for n, line in enumerate(lines, 1):
@@ -229,20 +240,29 @@ def message_text(entry: Entry) -> str:
     return name
 
 
+def clip(text, limit: int = MAX_TEXT_CHARS) -> str:
+    """``text`` cut to ``limit`` characters, saying how much was cut."""
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... ({len(text) - limit} more chars)"
+
+
 def entry_line(entry: Entry) -> str:
     r = entry.record
     if entry.kind == "pd":
         retry = " (retry)" if entry.retry else ""
-        return (f"t={entry.t} {r.get('sop', 'SOP')} {message_text(entry)}{retry} "
-                f"[{wire_groups(r.get('wire', ''))}]")
+        return (f"t={entry.t} {r.get('sop', 'SOP')} {clip(message_text(entry))}{retry} "
+                f"[{clip(wire_groups(r.get('wire', '')), MAX_HEX_CHARS)}]")
     t = "?" if entry.t is None else entry.t
     if entry.kind == "conn":
         code = r.get("code")
         code_text = f"0x{code:02x}" if isinstance(code, int) else "?"
-        return f"t={t} {r.get('event')} (code {code_text}) [{r.get('raw_event', '')}]"
+        return (f"t={t} {clip(r.get('event'), 40)} (code {code_text}) "
+                f"[{clip(r.get('raw_event', ''), MAX_HEX_CHARS)}]")
     if entry.kind == "mark":
-        return f"t~{t} mark: {r.get('text', '')}"
-    return f"t~{t} error {r.get('kind')}: {str(r.get('message', ''))[:120]}"
+        return f"t~{t} mark: {clip(r.get('text', ''))}"
+    return f"t~{t} error {clip(r.get('kind'), 60)}: {clip(r.get('message', ''))}"
 
 
 # --- analysis ---------------------------------------------------------------------------
@@ -494,7 +514,8 @@ def full(capture: Capture, sop=None, types=None, since=None, limit=None,
     page, next_since = _page(matched, _limit("full", limit))
     return {"path": str(capture.path),
             "messages": [{"i": e.record.get("i"), "t": e.t, "sop": e.record.get("sop"),
-                          "wire": e.record.get("wire"), "decoded": e.decoded} for e in page],
+                          "wire": clip(e.record.get("wire"), MAX_HEX_CHARS),
+                          "decoded": e.decoded} for e in page],
             "count": len(page), "total": len(matched), "next_since": next_since}
 
 

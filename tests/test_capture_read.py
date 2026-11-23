@@ -242,7 +242,7 @@ def test_identity_vdos_of_a_dual_role_partner():
 
 def _pd(i, t, wire, sop="SOP"):
     code = {"SOP": 0, "SOP'": 1}[sop]
-    head = bytes([0x80 | (len(wire) // 2 + 5)]) + t.to_bytes(4, "little") + bytes([code])
+    head = bytes([0x80 | ((len(wire) // 2 + 5) & 0x3F)]) + t.to_bytes(4, "little") + bytes([code])
     return {"type": "pd", "i": i, "t_meter_ms": t, "sop": sop, "wire": wire,
             "raw_event": head.hex() + wire}
 
@@ -275,3 +275,36 @@ def test_soft_reset_ends_the_negotiation_in_progress(tmp_path):
     (req,) = cr.read(path, "facts")["requests"]
     assert req["outcome"] is None and req["ps_rdy_t"] is None
     assert cr.read(path)["contract"] is None
+
+
+# --- file checks and long fields ------------------------------------------------------------
+
+def test_reader_requires_a_regular_file(tmp_path):
+    with pytest.raises(ValueError, match="not a regular file"):
+        cr.read(tmp_path)
+    with pytest.raises(ValueError, match="no such file"):
+        cr.read(tmp_path / "missing.jsonl")
+
+
+def test_reader_refuses_a_file_over_the_size_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(cr, "MAX_FILE_BYTES", 1000)
+    (tmp_path / "big.jsonl").write_text(GOLDEN.read_text())
+    with pytest.raises(ValueError, match="this reader loads at most 1000 bytes"):
+        cr.read(tmp_path / "big.jsonl")
+
+
+def test_long_mark_error_and_wire_are_cut_with_an_indication(tmp_path):
+    long_wire = "a303" + "00" * 400
+    path = _write(tmp_path, [
+        HEADER,
+        {"type": "status", "t_host": 1.0, "t_meter_ms": 1000, "vbus_mv": 5000},
+        {"type": "mark", "t_host": 1.0, "text": "m" * 5000},
+        {"type": "error", "t_host": 1.0, "kind": "ProtocolError", "message": "e" * 5000},
+        _pd(0, 1001, long_wire),
+    ])
+    lines = cr.read(path, "messages")["lines"]
+    assert all(len(line) < 600 for line in lines)
+    assert "(4800 more chars)" in lines[0] and "(4800 more chars)" in lines[1]
+    assert "more chars)]" in lines[2]
+    (msg,) = cr.read(path, "full")["messages"]
+    assert len(msg["wire"]) < 200 and msg["wire"].endswith("more chars)")
