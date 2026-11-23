@@ -4,3 +4,5 @@ __pycache__/
 .pytest_cache/
 .superpowers/
 docs/superpowers/
+uv.lock
+.ruff_cache/
