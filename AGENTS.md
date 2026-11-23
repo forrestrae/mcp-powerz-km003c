@@ -49,11 +49,41 @@ scripts/setup_hooks.sh
 
 ### Merging
 
-1. Rebase the branch onto `main`, commit everything, and run `scripts/verify.sh` in the worktree. It refuses a dirty tree, untracked files included, then runs `uv run pytest -m "not hw"` and `uv run ruff check`.
+1. Rebase the branch onto `main`, commit everything, and run `scripts/verify.sh` in the worktree. It refuses a dirty tree, untracked files included, then runs `uv run pytest -m "not hw"` and `uv run ruff check`. An `upstream/<topic>` branch follows "Merging an upstream branch" instead.
 2. `main` moves only by `git merge --no-ff <branch> -m "Merge branch '<branch>'"`, run in the checkout that has `main`.
 3. The human pushes `main` and tags releases `vX.Y.Z`. Consuming projects pin those tags.
 
 Agents never push. The `pre-push` hook refuses every push when `CLAUDECODE`, `CODEX_THREAD_ID`, `CODEX_SESSION_ID`, `CODEX_TOOL_CALL_ID`, `CODEX_SANDBOX`, or `WORKFLOW_AGENT=1` is set. Agents also do not tag, bypass hooks with `--no-verify`, or change the hook configuration.
+
+### Merging an upstream branch
+
+An `upstream/<topic>` branch is never rebased onto `main`, because that would carry the fork's workflow commits into the pull-request head. It also lacks `scripts/verify.sh` and the fork's ruff configuration, since both exist only on `main`. Verify it in two stages instead:
+
+1. In the worktree that holds the `upstream/<topic>` branch, commit the change and run the unit tests; they pass with the `hw` tests deselected. Leave the `uv.lock` that `uv run` creates uncommitted, because upstream does not track it.
+
+    ```bash
+    uv run pytest -m "not hw"
+    ```
+
+2. In the same worktree, run ruff with the rule subset the fork's configuration selects. It reports `All checks passed!`.
+
+    ```bash
+    uvx ruff check --select E4,E7,E9,F
+    ```
+
+3. In the checkout that has `main`, merge the branch without rebasing it.
+
+    ```bash
+    git merge --no-ff upstream/<topic> -m "Merge branch 'upstream/<topic>'"
+    ```
+
+4. In the same checkout, run the full gate on the merge result. It ends with `verify: passed on <commit>`. If it fails, undo the merge with `git reset --merge ORIG_HEAD` and fix the branch.
+
+    ```bash
+    scripts/verify.sh
+    ```
+
+When several upstream branches form a stack, each cut from the tip of the previous one, run steps 1 and 2 on every branch and merge them in stack order.
 
 ### Worktree layout
 
