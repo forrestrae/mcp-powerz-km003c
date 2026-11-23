@@ -308,10 +308,14 @@ class Recorder:
                         out.stop_reason = self._pd.ingest(packet.payload) or out.stop_reason
                     except (OSError, ValueError) as exc:  # the capture file; not the stream
                         out.pd_failure = exc
+                        continue
+                    if self._pd.parse_error is not None:
+                        # The session already wrote the error record with the payload.
+                        out.pd_bad = ProtocolError(self._pd.parse_error)
             if self._pd_active and out.pd_failure is None:
                 try:
-                    if out.pd_bad is not None:
-                        self._pd.error("ProtocolError", str(out.pd_bad))
+                    if frame_error is not None and out.pd_bad is frame_error:
+                        self._pd.error("ProtocolError", str(frame_error))
                     out.stop_reason = out.stop_reason or self._pd.check_timeout()
                 except (OSError, ValueError) as exc:
                     out.pd_failure = exc

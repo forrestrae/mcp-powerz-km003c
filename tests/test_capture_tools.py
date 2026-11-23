@@ -262,3 +262,30 @@ def test_capture_survives_poll_timing(bench_factory):
         assert "error" not in out
     bench.tools.pd_capture_stop()
     assert records(path)[-1]["type"] == "footer"
+
+
+def test_repeated_corrupt_pd_payloads_end_the_capture(bench_factory):
+    corrupt = S3[0] + bytes.fromhex("8300")  # a truncated event header after the status
+    bench = bench_factory([S3[0]] + [corrupt] * MAX_CONSECUTIVE_PROTOCOL_ERRORS)
+    path = bench.tools.pd_capture_start()["path"]
+    assert bench.tools.pd_capture_wait(timeout_s=5)["reason"] == "error"
+    recs = records(path)
+    # One error record (with the payload) per corrupt poll, then the one that ended it.
+    assert recs[-1]["errors"] == MAX_CONSECUTIVE_PROTOCOL_ERRORS + 1
+    errors = [r for r in recs if r["type"] == "error"]
+    assert all("payload" in r for r in errors[:-1])
+    assert "polls in a row failed to parse" in recs[-2]["message"]
+
+
+def test_a_good_poll_resets_the_pd_error_count(bench_factory):
+    corrupt = S3[0] + bytes.fromhex("8300")
+    payloads = [S3[0]] + [corrupt] * (MAX_CONSECUTIVE_PROTOCOL_ERRORS - 1) + [S3[1]] \
+        + [corrupt] * (MAX_CONSECUTIVE_PROTOCOL_ERRORS - 1)
+    bench = bench_factory(payloads)
+    bench.tools.pd_capture_start()
+    deadline = time.monotonic() + 3
+    while bench.meters[0].pd_payloads and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.05)
+    assert bench.service.recorder.pd_running
+    bench.tools.pd_capture_stop()
