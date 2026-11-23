@@ -12,10 +12,10 @@ if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
     exit 1
 fi
 
-echo "verify: uv run pytest -m \"not hw\""
-uv run pytest -m "not hw"
+echo "verify: uv run --extra dev pytest -m \"not hw\""
+uv run --extra dev pytest -m "not hw"
 
-echo "verify: uv run ruff check"
-uv run ruff check
+echo "verify: uv run --extra dev ruff check"
+uv run --extra dev ruff check
 
 echo "verify: passed on $(git rev-parse --short HEAD)"

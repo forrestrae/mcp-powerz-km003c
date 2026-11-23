@@ -15,11 +15,11 @@ uv sync --extra dev
 ```
 
 ```bash
-uv run pytest -m "not hw"
+uv run --extra dev pytest -m "not hw"
 ```
 
 ```bash
-uv run ruff check
+uv run --extra dev ruff check
 ```
 
 Hardware tests run only with `KM003C_HW=1` and a meter attached. Ruff is configured to the pyflakes and pycodestyle error subset, because the default rule set flags upstream code that this fork does not rewrite.
@@ -49,7 +49,7 @@ scripts/setup_hooks.sh
 
 ### Merging
 
-1. Rebase the branch onto `main`, commit everything, and run `scripts/verify.sh` in the worktree. It refuses a dirty tree, untracked files included, then runs `uv run pytest -m "not hw"` and `uv run ruff check`. An `upstream/<topic>` branch follows "Merging an upstream branch" instead.
+1. Rebase the branch onto `main`, commit everything, and run `scripts/verify.sh` in the worktree. It refuses a dirty tree, untracked files included, then runs `uv run --extra dev pytest -m "not hw"` and `uv run --extra dev ruff check`. An `upstream/<topic>` branch follows "Merging an upstream branch" instead.
 2. `main` moves only by `git merge --no-ff <branch> -m "Merge branch '<branch>'"`, run in the checkout that has `main`.
 3. The human pushes `main` and tags releases `vX.Y.Z`. Consuming projects pin those tags.
 
@@ -62,7 +62,7 @@ An `upstream/<topic>` branch is never rebased onto `main`, because that would ca
 1. In the worktree that holds the `upstream/<topic>` branch, commit the change and run the unit tests; they pass with the `hw` tests deselected. Leave the `uv.lock` that `uv run` creates uncommitted, because upstream does not track it.
 
     ```bash
-    uv run pytest -m "not hw"
+    uv run --extra dev pytest -m "not hw"
     ```
 
 2. In the same worktree, run ruff with the rule subset the fork's configuration selects. It reports `All checks passed!`.
