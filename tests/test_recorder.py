@@ -506,3 +506,175 @@ def test_latest_status_waits_for_the_first_block():
     assert rec.latest_pd_status(wait_s=0.05) is None
     assert time.monotonic() - started >= 0.05
     rec.stop_pd()
+
+
+# --- stream and capture errors stay apart -------------------------------------------------
+
+BAD_ADC = LogicalPacket(ATT_ADCQUEUE, True, 1, bytes(7))  # not a multiple of 20 bytes
+
+
+def pd_reply():
+    return LogicalPacket(ATT_PD, False, 0, PD_STREAM[:12])
+
+
+def test_adc_parse_error_is_not_written_into_the_capture():
+    dev = FakeDevice([[BAD_ADC, pd_reply()]] * 3)
+    rec = Recorder(lambda: dev, poll_interval_s=0.001)
+    rec.start_stream(3)
+    rec.start_pd()
+    wait_until(lambda: len(dev.masks) > 5)
+    assert rec.pd_running and rec.stream_status()["running"]
+    rec.stop_pd()
+    rec.stop_stream()
+    assert not any(r["type"] == "error" for r in records(rec.capture_path))
+
+
+def test_repeated_adc_parse_errors_end_the_stream_not_the_capture():
+    from km003c_mcp.recorder import MAX_CONSECUTIVE_PROTOCOL_ERRORS
+    dev = FakeDevice([[BAD_ADC, pd_reply()]] * MAX_CONSECUTIVE_PROTOCOL_ERRORS)
+    rec = Recorder(lambda: dev, poll_interval_s=0.001)
+    rec.start_stream(3)
+    rec.start_pd()
+    wait_until(lambda: not rec.stream_status()["running"])
+    assert "polls in a row failed to parse" in rec.stream_status()["error"]
+    assert ("stop",) in dev.graph
+    time.sleep(0.02)
+    assert rec.pd_running and dev.monitor == ["enable"]
+    rec.stop_pd()
+
+
+def test_capture_file_failure_ends_the_capture_not_the_stream():
+    dev = FakeDevice()
+    rec = Recorder(lambda: dev, poll_interval_s=0.001)
+    rec.start_stream(3)
+    rec.start_pd()
+
+    def full(record):
+        raise OSError(28, "No space left on device")
+    rec._pd.writer.write = full
+    dev.replies = [[pd_reply()]]
+    wait_until(lambda: not rec.pd_running)
+    assert "No space left" in rec.pd_capture_state()["error"]
+    assert dev.monitor == ["enable", "disable"]
+    time.sleep(0.02)
+    assert rec.stream_status()["running"] and dev.graph == [("start", 3)]
+    rec.stop_stream()
+
+
+def test_csv_failure_ends_the_stream_not_the_capture(tmp_path):
+    dev = FakeDevice()
+    rec = Recorder(lambda: dev, poll_interval_s=0.001)
+    rec.start_stream(3, csv_path=str(tmp_path / "s.csv"))
+    rec.start_pd()
+
+    class FullCsv:
+        def writerow(self, row):
+            raise OSError(28, "No space left on device")
+    rec._stream._csv = FullCsv()
+    dev.replies = [queue(range(0, 5))]
+    wait_until(lambda: not rec.stream_status()["running"])
+    assert "No space left" in rec.stream_status()["error"]
+    time.sleep(0.02)
+    assert rec.pd_running and dev.monitor == ["enable"]
+    rec.stop_pd()
+    assert records(rec.capture_path)[-1]["reason"] == "manual"
+
+
+def test_manual_stop_does_not_disable_a_newer_captures_monitor():
+    class Dev(FakeDevice):
+        """enable and disable take the device lock; polling does not."""
+
+        def enable_pd_monitor(self):
+            with self.lock:
+                return super().enable_pd_monitor()
+
+        def disable_pd_monitor(self):
+            with self.lock:
+                return super().disable_pd_monitor()
+
+    dev = Dev()
+    rec = Recorder(lambda: dev, poll_interval_s=0.001)
+    rec.start_pd()
+    first = rec.capture_path
+    with dev.lock:
+        stopper = threading.Thread(target=rec.stop_pd)
+        stopper.start()
+        wait_until(lambda: not rec.pd_running)
+        time.sleep(0.05)  # the stop is now waiting for the device lock
+        rec.start_pd()  # a new capture enables the monitor before the old stop disables it
+    stopper.join(3)
+    assert dev.monitor == ["enable", "enable"]  # the old stop's disable was skipped
+    assert rec.pd_running and rec.capture_path != first
+    assert records(first)[-1]["reason"] == "manual"
+    rec.stop_pd()
+    assert dev.monitor == ["enable", "enable", "disable"]
+
+
+def test_wait_returns_after_a_manual_stop_has_disabled_the_monitor():
+    release = threading.Event()
+
+    class SlowDisable(FakeDevice):
+        def disable_pd_monitor(self):
+            release.wait(2)
+            return super().disable_pd_monitor()
+
+    dev = SlowDisable()
+    rec = Recorder(lambda: dev, poll_interval_s=0.001)
+    rec.start_pd()
+    stopper = threading.Thread(target=rec.stop_pd)
+    stopper.start()
+    wait_until(lambda: not rec.pd_running)
+    assert rec.wait_pd(0.05) is False  # the disable has not gone out yet
+    release.set()
+    assert rec.wait_pd(2) is True and dev.monitor == ["enable", "disable"]
+    stopper.join(2)
+
+
+# --- a failed start leaves nothing behind -------------------------------------------------
+
+def test_header_failure_after_enable_closes_the_file_releases_and_disables(monkeypatch):
+    from km003c_mcp.capture import CaptureSession
+    dev = FakeDevice()
+    leases = LeaseLog(dev)
+    rec = Recorder(lambda: dev, poll_interval_s=0.001, lease=leases)
+    sessions = []
+    original = CaptureSession.__init__
+
+    def remember(self, *a, **k):
+        original(self, *a, **k)
+        sessions.append(self)
+
+    def broken_header(self, **kwargs):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(CaptureSession, "__init__", remember)
+    monkeypatch.setattr(CaptureSession, "write_header", broken_header)
+    with pytest.raises(OSError):
+        rec.start_pd()
+    assert sessions[0].writer.closed
+    assert [e[0] for e in leases.events] == ["take", "release"]
+    assert dev.monitor == ["enable", "disable"]
+    assert not rec.pd_running
+
+
+def test_lost_start_race_releases_its_lease_when_its_file_fails(monkeypatch):
+    from km003c_mcp.capture import CaptureSession
+    dev = FakeDevice()
+    leases = LeaseLog(dev)
+    rec = Recorder(lambda: dev, poll_interval_s=0.001, lease=leases)
+
+    def enable_while_another_start_wins():
+        dev.monitor.append("enable")
+        rec._pd_active = True  # the other start finished first
+        return ACCEPTED
+    dev.enable_pd_monitor = enable_while_another_start_wins
+    original_finish = CaptureSession.finish
+
+    def failing_finish(self, *a, **k):
+        original_finish(self, *a, **k)
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(CaptureSession, "finish", failing_finish)
+    with pytest.raises(Km003cError, match="already running"):
+        rec.start_pd()
+    assert [e[0] for e in leases.events] == ["take", "release"]
+    assert dev.monitor == ["enable"]  # the winner keeps the monitor
+    rec._pd_active = False

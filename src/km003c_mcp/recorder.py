@@ -43,8 +43,11 @@ DEFAULT_PD_POLL_MS = 50
 MIN_PD_POLL_MS = 1
 MAX_PD_POLL_MS = 10_000
 # A reply that fails to parse loses that poll's data but leaves the link working, so the
-# poller records it and goes on; this many in a row end the stream and the capture.
+# poller records it and goes on; this many in a row end the stream or the capture they hit.
 MAX_CONSECUTIVE_PROTOCOL_ERRORS = 10
+# wait_pd waits at most this long per call; larger values (and inf) are clamped, because
+# Condition.wait raises OverflowError past threading.TIMEOUT_MAX.
+MAX_WAIT_S = 24 * 3600.0
 
 
 @dataclass
@@ -169,6 +172,18 @@ class _NoLease:
         pass
 
 
+@dataclass
+class _PollOutcome:
+    """What one poll did to the stream and the capture, kept apart."""
+
+    pd_gen: int = 0
+    stop_reason: str | None = None
+    stream_bad: ProtocolError | None = None
+    pd_bad: ProtocolError | None = None
+    stream_failure: Exception | None = None
+    pd_failure: Exception | None = None
+
+
 class Recorder:
     def __init__(self, device_provider: Callable[[], Km003cDevice],
                  poll_interval_s: float | None = None, keep_samples: int = 10_000,
@@ -229,7 +244,7 @@ class Recorder:
 
     def _run(self) -> None:
         me = threading.current_thread()
-        protocol_errors = 0
+        stream_errors = pd_errors = 0
         while True:
             with self._state:
                 if self._thread is not me:
@@ -244,43 +259,75 @@ class Recorder:
                     self._thread = None
                     return
             try:
-                bad: ProtocolError | None = None
+                frame_error: ProtocolError | None = None
                 try:
                     packets = device.get_data(mask)
                 except ProtocolError as exc:
-                    packets, bad = [], exc
-                stop_reason = None
-                with self._state:
-                    pd_gen = self._pd_gen
-                    for packet in packets:
-                        if packet.attribute == ATT_ADCQUEUE and self._stream:
-                            try:
-                                samples = parse_adcqueue(packet.payload, self._stream.rate_index)
-                            except ProtocolError as exc:
-                                bad = exc
-                                continue
-                            self._stream.feed(samples)
-                        elif packet.attribute == ATT_PD and self._pd_active:
-                            if len(packet.payload) >= PD_STATUS_SIZE:
-                                status = parse_pd(packet.payload[:PD_STATUS_SIZE])
-                                self._pd_status = (status, time.monotonic())
-                            stop_reason = self._pd.ingest(packet.payload) or stop_reason
-                    if self._pd_active:
-                        if bad is not None:
-                            self._pd.error("ProtocolError", str(bad))
-                        stop_reason = stop_reason or self._pd.check_timeout()
-                protocol_errors = protocol_errors + 1 if bad is not None else 0
-                if protocol_errors >= MAX_CONSECUTIVE_PROTOCOL_ERRORS:
-                    raise ProtocolError(f"{protocol_errors} polls in a row failed to parse; "
-                                        f"last: {bad}")
-                if bad is not None:
-                    log.warning("dropping a poll that failed to parse: %s", bad)
-                if stop_reason is not None:
-                    self._end_pd(stop_reason, pd_gen)
+                    packets, frame_error = [], exc
+                outcome = self._ingest(packets, frame_error, mask)
+                # Parse errors count per consumer: a bad AdcQueue block says nothing about the
+                # PD data in the same reply, and the reverse.
+                stream_errors = stream_errors + 1 if outcome.stream_bad else 0
+                pd_errors = pd_errors + 1 if outcome.pd_bad else 0
+                end_stream, end_pd = outcome.stream_failure, outcome.pd_failure
+                if end_stream is None and stream_errors >= MAX_CONSECUTIVE_PROTOCOL_ERRORS:
+                    end_stream = ProtocolError(f"{stream_errors} polls in a row failed to parse; "
+                                               f"last: {outcome.stream_bad}")
+                if end_pd is None and pd_errors >= MAX_CONSECUTIVE_PROTOCOL_ERRORS:
+                    end_pd = ProtocolError(f"{pd_errors} polls in a row failed to parse; "
+                                           f"last: {outcome.pd_bad}")
+                if outcome.stream_bad or outcome.pd_bad:
+                    log.warning("dropping data that failed to parse: %s",
+                                outcome.stream_bad or outcome.pd_bad)
+                if end_stream is not None:
+                    stream_errors = 0
+                    self._fail(end_stream, pd=False, last=False)
+                if end_pd is not None:
+                    pd_errors = 0
+                    self._fail(end_pd, stream=False, last=False)
+                elif outcome.stop_reason is not None:
+                    self._end_pd(outcome.stop_reason, outcome.pd_gen)
                 time.sleep(poll)
             except Exception as exc:  # noqa: BLE001 - any failure ends the capture and is reported
                 self._fail(exc)
                 return
+
+    def _ingest(self, packets, frame_error: ProtocolError | None, mask: int) -> _PollOutcome:
+        """Feed one reply to the stream and the capture, keeping each one's errors its own."""
+        out = _PollOutcome()
+        with self._state:
+            out.pd_gen = self._pd_gen
+            if frame_error is not None:
+                out.stream_bad = frame_error if mask & ATT_ADCQUEUE and self._stream else None
+                out.pd_bad = frame_error if mask & ATT_PD and self._pd_active else None
+            for packet in packets:
+                if packet.attribute == ATT_ADCQUEUE and self._stream:
+                    try:
+                        self._stream.feed(parse_adcqueue(packet.payload, self._stream.rate_index))
+                    except ProtocolError as exc:
+                        out.stream_bad = exc
+                    except OSError as exc:  # the CSV file; the capture is not affected
+                        out.stream_failure = exc
+                elif packet.attribute == ATT_PD and self._pd_active:
+                    if len(packet.payload) >= PD_STATUS_SIZE:  # for pd_status during a capture
+                        status = parse_pd(packet.payload[:PD_STATUS_SIZE])
+                        self._pd_status = (status, time.monotonic())
+                    try:
+                        out.stop_reason = self._pd.ingest(packet.payload) or out.stop_reason
+                    except (OSError, ValueError) as exc:  # the capture file; not the stream
+                        out.pd_failure = exc
+                        continue
+                    if self._pd.parse_error is not None:
+                        # The session already wrote the error record with the payload.
+                        out.pd_bad = ProtocolError(self._pd.parse_error)
+            if self._pd_active and out.pd_failure is None:
+                try:
+                    if frame_error is not None and out.pd_bad is frame_error:
+                        self._pd.error("ProtocolError", str(frame_error))
+                    out.stop_reason = out.stop_reason or self._pd.check_timeout()
+                except (OSError, ValueError) as exc:
+                    out.pd_failure = exc
+        return out
 
     def abort(self, reason: str) -> bool:
         """Mark any running stream/capture as failed without touching the device.
@@ -293,36 +340,48 @@ class Recorder:
             lease.release()
         return had_stream
 
-    def _abort_locked(self, reason: str, error: tuple[str, str]) -> tuple[bool, bool, list]:
-        """Mark the stream and capture failed; return whether each ran and their leases.
+    def _abort_locked(self, reason: str, error: tuple[str, str], stream: bool = True,
+                      pd: bool = True) -> tuple[bool, bool, list]:
+        """Mark the stream and/or capture failed; return whether each ran and their leases.
 
         A running capture gets an ``error`` record (``error`` is its kind and message) and a
         footer with reason ``error``.
         """
-        had_stream = self._stream is not None
-        had_pd = self._pd_active
-        if self._stream:
-            self._stream.close()
+        had_stream = stream and self._stream is not None
+        had_pd = pd and self._pd_active
+        leases = []
+        if had_stream:
+            try:
+                self._stream.close()
+            except OSError as exc:
+                log.warning("could not close the stream's CSV file: %s", exc)
             self._last_stats = self._stream.stats
             self._stream = None
             self._stream_error = reason
-        if self._pd_active:
+        if stream and self._stream_lease is not None:
+            leases.append(self._stream_lease)
+            self._stream_lease = None
+        if had_pd:
             self._pd_active = False
             self._pd_error = reason
             self._close_capture_locked("error", error)
-        leases = [lease for lease in (self._stream_lease, self._pd_lease) if lease is not None]
-        self._stream_lease = self._pd_lease = None
+        if pd and self._pd_lease is not None:
+            leases.append(self._pd_lease)
+            self._pd_lease = None
         return had_stream, had_pd, leases
 
-    def _fail(self, exc: Exception) -> None:
+    def _fail(self, exc: Exception, stream: bool = True, pd: bool = True,
+              last: bool = True) -> None:
+        """End the stream and/or capture after ``exc``; ``last`` when the poller then exits."""
         with self._state:
             had_stream, had_pd, leases = self._abort_locked(
-                f"{type(exc).__name__}: {exc}", (type(exc).__name__, str(exc)))
+                f"{type(exc).__name__}: {exc}", (type(exc).__name__, str(exc)), stream, pd)
             stream_gen, pd_gen = self._stream_gen, self._pd_gen
             if had_pd:
                 self._pd_ending = True
             # Stop being the poller now: a start during the cleanup below gets a new thread.
-            if self._thread is threading.current_thread():
+            # A poller that keeps going for the other consumer stays the poller.
+            if last and self._thread is threading.current_thread():
                 self._thread = None
         device = self._device
         try:
@@ -482,6 +541,7 @@ class Recorder:
             self._pd_gen += 1
         lease = self._take_lease("pd capture")
         meter: dict = {"serial": None, "fw_version": None, "hw_version": None}
+        device = monitor = None
         try:
             device = self._provider()
             meter["serial"] = getattr(device, "serial_number", None) or None
@@ -497,32 +557,62 @@ class Recorder:
                                                           **monitor.to_dict()}, **header)
         except BaseException as exc:
             try:
-                if not session.header_written:
-                    session.write_header(meter=meter, pd_monitor=None, **header)
-                session.finish("error", (type(exc).__name__, str(exc)))
-            except (OSError, ValueError):
-                pass
-            with self._state:
-                if not self._pd_active:
-                    self._pd = session  # the failed attempt is the last capture
-            lease.release()
+                self._abandon_start(session, meter, header, exc,
+                                    device if monitor is not None else None)
+            finally:
+                lease.release()
             raise
         with self._state:
-            if self._pd_active:  # another start won the race
+            lost = self._pd_active  # another start won the race
+            if not lost:
+                self._device = device
+                self._pd = session
+                self._pd_active = True
+                self._pd_error = None
+                self._pd_monitor = monitor
+                self._pd_status = None
+                previous, self._pd_lease = self._pd_lease, lease
+                self._ensure_thread_locked()
+        if lost:
+            # The winner needs the monitor, so it stays enabled; only this file is closed.
+            try:
                 session.finish("error", ("Km003cError", "another PD capture started first"))
+            except (OSError, ValueError) as exc:
+                log.warning("could not finish the capture file %s: %s", session.path, exc)
+            finally:
                 lease.release()
-                raise Km003cError("a PD capture is already running; stop it first")
-            self._device = device
-            self._pd = session
-            self._pd_active = True
-            self._pd_error = None
-            self._pd_monitor = monitor
-            self._pd_status = None
-            previous, self._pd_lease = self._pd_lease, lease
-            self._ensure_thread_locked()
+            raise Km003cError("a PD capture is already running; stop it first")
         if previous is not None:
             previous.release()
         return monitor
+
+    def _abandon_start(self, session: CaptureSession, meter: dict, header: dict,
+                       exc: BaseException, enabled_on) -> None:
+        """Clean up after a start that failed: finish and close its file, and disable the PD
+        monitor when this start enabled it (``enabled_on`` is that device), unless a newer
+        start has run since."""
+        gen = self._pd_gen
+        try:
+            try:
+                if not session.header_written:
+                    session.write_header(meter=meter, pd_monitor=None, **header)
+            finally:
+                session.finish("error", (type(exc).__name__, str(exc)))
+        except (OSError, ValueError) as error:
+            log.warning("could not finish the capture file %s: %s", session.path, error)
+        with self._state:
+            if not self._pd_active:
+                self._pd = session  # the failed attempt is the last capture
+        if enabled_on is None:
+            return
+        with enabled_on.lock:
+            with self._state:
+                if self._pd_gen != gen or self._pd_active:
+                    return
+            try:
+                enabled_on.disable_pd_monitor()
+            except Exception as error:  # noqa: BLE001 - best effort; the start already failed
+                log.warning("DisablePdMonitor after a failed start failed: %s", error)
 
     def _end_pd(self, reason: str, gen: int) -> None:
         """Stop the capture from the poller when its condition or timeout is met."""
@@ -561,33 +651,50 @@ class Recorder:
     def stop_pd(self) -> Path | None:
         """Stop the capture (footer reason ``manual``) and disable the PD monitor.
 
-        Returns the path of the capture that was running, or None when none was.
+        Returns the path of the capture that was running, or None when none was. Waiters in
+        :meth:`wait_pd` return once the monitor is disabled and the lease released. A capture
+        started meanwhile keeps its monitor: the disable is skipped when a newer start
+        already ran.
         """
         with self._state:
             was_active, self._pd_active = self._pd_active, False
             lease, self._pd_lease = self._pd_lease, None
             device = self._device
+            gen = self._pd_gen
             if was_active:
+                self._pd_ending = True
                 self._close_capture_locked("manual")
             path = self._pd.path if was_active else None
         try:
             self._join_if_idle()
             if not was_active or device is None:
                 return path
-            try:
-                device.disable_pd_monitor()
-            except TransportError:
-                raise
-            except Km003cError as exc:
-                log.warning("DisablePdMonitor failed: %s", exc)
+            # Holding the device lock orders the disable against a new start's enable, as in
+            # _end_pd: a start that already ran is detected below, a later one runs after.
+            with device.lock:
+                with self._state:
+                    if self._pd_gen != gen:
+                        return path
+                try:
+                    device.disable_pd_monitor()
+                except TransportError:
+                    raise
+                except Km003cError as exc:
+                    log.warning("DisablePdMonitor failed: %s", exc)
         finally:
             if lease is not None:
                 lease.release()
+            if was_active:
+                self._pd_cleanup_done()
         return path
 
     def wait_pd(self, timeout_s: float) -> bool:
-        """Block until the capture stops or ``timeout_s`` passes; True if none is running."""
-        deadline = time.monotonic() + max(timeout_s, 0)
+        """Block until the capture stops or ``timeout_s`` passes; True if none is running.
+
+        ``timeout_s`` is clamped to 0 to :data:`MAX_WAIT_S`; NaN counts as 0.
+        """
+        timeout_s = min(timeout_s, MAX_WAIT_S) if timeout_s >= 0 else 0.0
+        deadline = time.monotonic() + timeout_s
         with self._pd_changed:
             while self._pd_active or self._pd_ending:
                 remaining = deadline - time.monotonic()

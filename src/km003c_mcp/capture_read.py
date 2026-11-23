@@ -9,7 +9,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .capture import FORMAT, VERSION, capture_dir, extend_timestamp24
+from .capture import FORMAT, VERSION, RetryFilter, capture_dir, extend_timestamp24
 from .pd import SOP_NAMES, PdDecoder
 from .pd_objects import bits
 from .protocol import PdEvent
@@ -18,6 +18,11 @@ MODES = ("summary", "messages", "facts", "full")
 SUMMARY_MAX_BYTES = 2048
 DEFAULT_LIMITS = {"messages": 50, "full": 20}
 MAX_LIMIT = 500
+# A capture of a long session is a few MB; refuse to load anything far larger into memory.
+MAX_FILE_BYTES = 64 * 1024 * 1024
+# Per-entry caps in summary, messages and full output; a longer value is cut and says so.
+MAX_TEXT_CHARS = 200
+MAX_HEX_CHARS = 160
 # VBUS moving less than this across the capture counts as flat for the sanity rules.
 VBUS_FLAT_MV = 500
 _SOP_CODES = {name.lower(): code for code, name in SOP_NAMES.items()}
@@ -34,6 +39,8 @@ class Entry:
     record: dict
     decoded: dict | None = None
     sop: int | None = None
+    retry: bool = False  # a retransmission of the sender's previous message
+    line: int = 0  # the record's line number in the file: the position used for paging
 
     @property
     def msg(self) -> str | None:
@@ -77,10 +84,16 @@ def load_capture(path: str | Path) -> Capture:
     ``km003c-capture`` file this reader understands.
     """
     p = resolve_path(path)
+    if not p.is_file():
+        raise ValueError(f"{p} is not a regular file" if p.exists() else f"no such file: {p}")
+    size = p.stat().st_size
+    if size > MAX_FILE_BYTES:
+        raise ValueError(f"{p} is {size} bytes; this reader loads at most {MAX_FILE_BYTES} "
+                         "bytes (split the capture or read it with another tool)")
     records: list[dict] = []
     problems: list[str] = []
-    with open(p, encoding="utf-8") as f:
-        lines = f.read().split("\n")
+    with open(p, encoding="utf-8", errors="replace") as f:
+        lines = f.read(MAX_FILE_BYTES + 1).split("\n")
     if lines and lines[-1] == "":
         lines.pop()
     for n, line in enumerate(lines, 1):
@@ -92,50 +105,148 @@ def load_capture(path: str | Path) -> Capture:
             problems.append(f"line {n} is incomplete (the capture was cut off while writing)"
                             if n == len(lines) else f"line {n} is not a JSON object; skipped")
             continue
-        records.append(record)
-    if not records or records[0].get("type") != "header" or records[0].get("format") != FORMAT:
+        records.append((n, record))
+    first = records[0][1] if records else {}
+    if first.get("type") != "header" or first.get("format") != FORMAT:
         raise ValueError(f"{p} is not a {FORMAT} file (no header record)")
-    if records[0].get("version") != VERSION:
-        raise ValueError(f"{p} is {FORMAT} version {records[0].get('version')}; "
+    if first.get("version") != VERSION:
+        raise ValueError(f"{p} is {FORMAT} version {first.get('version')!r}; "
                          f"this reader understands version {VERSION}")
-    header = records[0]
-    footer = next((r for r in records if r.get("type") == "footer"), None)
-    body = [r for r in records[1:] if r.get("type") != "footer"]
+    header = _clean_header(first, problems)
+    footer = None
+    body = []
+    for n, r in records[1:]:
+        problem = _check_record(r)
+        if problem is not None:
+            problems.append(f"line {n}: {problem}; skipped")
+        elif r["type"] == "footer":
+            footer = footer or _clean_footer(r, problems)
+        else:
+            body.append((n, r))
 
     # Status blocks carry the 32-bit uptime; the nearest one at or before a record (else the
     # next one) is the reference for extending its 24-bit time and for placing marks.
-    status = [r for r in body if r.get("type") == "status"]
+    status = [r for _, r in body if r.get("type") == "status"]
     following: list[dict | None] = [None] * len(body)
     upcoming = None
     for k in range(len(body) - 1, -1, -1):
-        if body[k].get("type") == "status":
-            upcoming = body[k]
+        if body[k][1].get("type") == "status":
+            upcoming = body[k][1]
         following[k] = upcoming
 
     entries: list[Entry] = []
     decoder = PdDecoder()
+    retries = RetryFilter()
     last_status: dict | None = None
-    for k, r in enumerate(body):
+    for k, (n, r) in enumerate(body):
         kind = r.get("type")
         if kind == "status":
             last_status = r
             continue
         ref = last_status or following[k]
         ref_t = ref.get("t_meter_ms") if ref else None
+        ref_host = ref.get("t_host") if ref else None
         if kind == "pd":
-            entries.append(_decode_entry(r, decoder))
+            entry = _decode_entry(r, decoder)
+            wire = bytes.fromhex(r.get("wire") or "") if _is_hex(r.get("wire")) else b""
+            entry.retry = retries.is_retry(entry.sop, wire, entry.goodcrc)
+            entry.line = n
+            entries.append(entry)
         elif kind == "conn":
-            entries.append(Entry("conn", extend_timestamp24(r.get("t_meter_ms", 0), ref_t), r))
+            entries.append(Entry("conn", extend_timestamp24(r.get("t_meter_ms", 0), ref_t), r,
+                                 line=n))
         elif kind in ("mark", "error"):
             t = None
-            if ref is not None and "t_host" in r and "t_host" in ref:
-                t = round(ref_t + (r["t_host"] - ref["t_host"]) * 1000)
-            entries.append(Entry(kind, t, r))
+            if ref_t is not None and _is_number(r.get("t_host")) and _is_number(ref_host):
+                try:
+                    t = round(ref_t + (r["t_host"] - ref_host) * 1000)
+                except (OverflowError, ValueError):  # inf or NaN host times
+                    t = None
+            entries.append(Entry(kind, t, r, line=n))
     return Capture(p, header, footer, entries, status, problems)
 
 
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_text(value) -> bool:
+    return isinstance(value, str)
+
+
+def _optional(check):
+    return lambda value: value is None or check(value)
+
+
+# The fields each body record needs, with their checks; a record that fails is skipped.
+_RECORD_FIELDS = {
+    "status": {"t_meter_ms": _is_int, "vbus_mv": _is_int, "t_host": _optional(_is_number)},
+    "pd": {"t_meter_ms": _is_int, "wire": lambda v: _is_text(v) and _is_hex(v),
+           "raw_event": _optional(lambda v: _is_text(v) and _is_hex(v)),
+           "sop": _optional(_is_text), "i": _optional(_is_int)},
+    "conn": {"t_meter_ms": _is_int, "code": _optional(_is_int), "event": _optional(_is_text),
+             "raw_event": _optional(_is_text)},
+    "mark": {"t_host": _optional(_is_number), "text": _optional(_is_text)},
+    "error": {"t_host": _optional(_is_number), "kind": _optional(_is_text),
+              "message": _optional(_is_text)},
+    "footer": {"reason": _optional(_is_text)},
+}
+
+
+def _check_record(r: dict) -> str | None:
+    """Why a body record cannot be used, or None."""
+    kind = r.get("type")
+    fields = _RECORD_FIELDS.get(kind) if isinstance(kind, str) else None
+    if fields is None:
+        return f"unknown record type {clip(repr(kind), 40)}"
+    for name, check in fields.items():
+        if not check(r.get(name)):
+            return f"{kind} record has a bad {name} ({clip(repr(r.get(name)), 40)})"
+    return None
+
+
+def _clean_header(header: dict, problems: list[str]) -> dict:
+    """The header with every nested block a dict (or None) and the label text (or None)."""
+    out = dict(header)
+    for name in ("meter", "server", "pd_monitor", "stop"):
+        if out.get(name) is not None and not isinstance(out[name], dict):
+            problems.append(f"line 1: header {name} is not an object; ignored")
+            out[name] = None
+    if out.get("label") is not None and not isinstance(out["label"], str):
+        out["label"] = str(out["label"])
+    return out
+
+
+def _clean_footer(footer: dict, problems: list[str]) -> dict:
+    """The footer with malformed counts or VBUS statistics dropped."""
+    out = dict(footer)
+    counts = out.get("counts")
+    if counts is not None and not (isinstance(counts, dict)
+                                   and all(_is_int(v) for v in counts.values())):
+        problems.append("footer counts are malformed; ignored")
+        out.pop("counts")
+    vbus = out.get("vbus_mv")
+    if vbus is not None and not (isinstance(vbus, dict) and all(
+            _optional(_is_int)(vbus.get(k)) for k in ("first", "last", "min", "max"))):
+        problems.append("footer vbus_mv is malformed; ignored")
+        out.pop("vbus_mv")
+    return out
+
+
+def _is_hex(value) -> bool:
+    try:
+        bytes.fromhex(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def _decode_entry(r: dict, decoder: PdDecoder) -> Entry:
-    raw = bytes.fromhex(r.get("raw_event") or "")
+    raw = bytes.fromhex(r.get("raw_event") or "")  # checked by _check_record
     sop = raw[5] if len(raw) >= 6 else _SOP_CODES.get(str(r.get("sop", "SOP")).lower(), 0)
     try:
         wire = bytes.fromhex(r.get("wire") or "")
@@ -216,19 +327,29 @@ def message_text(entry: Entry) -> str:
     return name
 
 
+def clip(text, limit: int = MAX_TEXT_CHARS) -> str:
+    """``text`` cut to ``limit`` characters, saying how much was cut."""
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... ({len(text) - limit} more chars)"
+
+
 def entry_line(entry: Entry) -> str:
     r = entry.record
     if entry.kind == "pd":
-        return (f"t={entry.t} {r.get('sop', 'SOP')} {message_text(entry)} "
-                f"[{wire_groups(r.get('wire', ''))}]")
+        retry = " (retry)" if entry.retry else ""
+        return (f"t={entry.t} {r.get('sop', 'SOP')} {clip(message_text(entry))}{retry} "
+                f"[{clip(wire_groups(r.get('wire', '')), MAX_HEX_CHARS)}]")
     t = "?" if entry.t is None else entry.t
     if entry.kind == "conn":
         code = r.get("code")
         code_text = f"0x{code:02x}" if isinstance(code, int) else "?"
-        return f"t={t} {r.get('event')} (code {code_text}) [{r.get('raw_event', '')}]"
+        return (f"t={t} {clip(r.get('event'), 40)} (code {code_text}) "
+                f"[{clip(r.get('raw_event', ''), MAX_HEX_CHARS)}]")
     if entry.kind == "mark":
-        return f"t~{t} mark: {r.get('text', '')}"
-    return f"t~{t} error {r.get('kind')}: {str(r.get('message', ''))[:120]}"
+        return f"t~{t} mark: {clip(r.get('text', ''))}"
+    return f"t~{t} error {clip(r.get('kind'), 60)}: {clip(r.get('message', ''))}"
 
 
 # --- analysis ---------------------------------------------------------------------------
@@ -238,15 +359,20 @@ def _objects(entry: Entry) -> list[str]:
 
 
 def negotiations(capture: Capture) -> list[dict]:
-    """Every Request on SOP with the PDO it names, its reply and the PS_RDY that ended it."""
+    """Every Request on SOP with the PDO it names, its reply and the PS_RDY that ended it.
+
+    Retransmissions count once. A Soft_Reset ends the negotiation in progress.
+    """
     out: list[dict] = []
     caps: Entry | None = None
     current: dict | None = None
     for e in capture.messages:
-        if e.sop != 0 or e.goodcrc:
+        if e.sop != 0 or e.goodcrc or e.retry:
             continue
         name = e.msg
-        if name in _CAPABILITIES:
+        if name == "Soft_Reset":
+            current = None  # as in StopTracker: the negotiation starts over
+        elif name in _CAPABILITIES:
             caps = e
         elif name in _REQUESTS and "request" in (e.decoded or {}):
             rdo_hex = _objects(e)[0] if _objects(e) else None
@@ -261,6 +387,7 @@ def negotiations(capture: Capture) -> list[dict]:
             current = {"t": e.t, "i": e.record.get("i"), "wire": e.record.get("wire"),
                        "rdo": {"hex": rdo_hex, **req}, "requested_pdo": pdo,
                        "source_capabilities_t": caps.t if caps else None,
+                       "source_capabilities_i": caps.record.get("i") if caps else None,
                        "outcome": None, "accept_t": None, "ps_rdy_t": None}
             out.append(current)
         elif current is not None and current["outcome"] is None and name in (
@@ -337,6 +464,8 @@ def warnings(capture: Capture, negs: list[dict] | None = None) -> list[str]:
         out.append(f"{len(errors)} error record(s); first: {first.get('kind')}: "
                    f"{str(first.get('message', ''))[:100]}")
     out.extend(capture.problems[:3])
+    if len(capture.problems) > 3:
+        out.append(f"{len(capture.problems) - 3} more unreadable or malformed records")
     return out
 
 
@@ -346,56 +475,107 @@ def _compact(obj) -> str:
     return json.dumps(obj, separators=(",", ":"))
 
 
-def summary(capture: Capture, max_bytes: int = SUMMARY_MAX_BYTES) -> dict:
+SUMMARY_MAX_WARNINGS = 5
+SUMMARY_MAX_COUNT_TYPES = 16
+
+
+def _clip_left(text: str, limit: int) -> str:
+    """``text`` cut from the left to ``limit`` characters; the end of a path matters most."""
+    return text if len(text) <= limit else "..." + text[-(limit - 3):]
+
+
+def _scalar(value, limit: int):
+    return clip(value, limit) if isinstance(value, str) else value
+
+
+def summary(capture: Capture, max_bytes: int = SUMMARY_MAX_BYTES,
+            extra: dict | None = None) -> dict:
     """Bounded overview: one line per non-GoodCRC message (plus connection events, marks and
-    errors), counts, VBUS, the final contract and the sanity warnings."""
+    errors), counts, VBUS, the final contract and the sanity warnings.
+
+    The compact JSON of the returned object, ``extra`` fields included, stays within
+    ``max_bytes``: lines from the middle go first, then warnings, counts and the contract,
+    and long fields are cut throughout.
+    """
     negs = negotiations(capture)
     footer = capture.footer
     header = capture.header
     counts: dict[str, int] = {}
     for e in capture.messages:
-        key = e.msg or "invalid"
+        key = clip(e.msg or "invalid", 40)
         counts[key] = counts.get(key, 0) + 1
+    if len(counts) > SUMMARY_MAX_COUNT_TYPES:
+        ranked = sorted(counts.items(), key=lambda kv: -kv[1])
+        counts = dict(ranked[:SUMMARY_MAX_COUNT_TYPES])
+        counts["other types"] = sum(v for _, v in ranked[SUMMARY_MAX_COUNT_TYPES:])
+    warns = [clip(w) for w in warnings(capture, negs)]
+    if len(warns) > SUMMARY_MAX_WARNINGS:
+        more = len(warns) - SUMMARY_MAX_WARNINGS + 1
+        warns = warns[:SUMMARY_MAX_WARNINGS - 1] + [f"{more} more warnings; read mode=facts"]
+    contract = contract_brief(final_contract(negs))
+    if contract is not None:
+        contract["text"] = clip(contract["text"], 120)
     out: dict = {
-        "path": str(capture.path), "label": (header.get("label") or None),
-        "meter_fw": (header.get("meter") or {}).get("fw_version"),
-        "pd_monitor": (header.get("pd_monitor") or {}).get("outcome"),
-        "reason": footer.get("reason") if footer else None,
+        "path": _clip_left(str(capture.path), 200),
+        "label": _scalar(header.get("label") or None, 80),
+        "meter_fw": _scalar((header.get("meter") or {}).get("fw_version"), 40),
+        "pd_monitor": _scalar((header.get("pd_monitor") or {}).get("outcome"), 60),
+        "reason": _scalar(footer.get("reason") if footer else None, 40),
         "complete": footer is not None,
         "counts": counts,
         "conn": sum(1 for e in capture.entries if e.kind == "conn"),
         "vbus_mv": vbus_stats(capture),
-        "contract": contract_brief(final_contract(negs)),
-        "warnings": [w[:200] for w in warnings(capture, negs)],
+        "contract": contract,
+        "warnings": warns,
+        **(extra or {}),
     }
-    if isinstance(out["label"], str):
-        out["label"] = out["label"][:80]
     lines = [entry_line(e) for e in capture.entries if not e.goodcrc]
     out["lines"] = lines
     out["truncated"] = False
-    if len(_compact(out)) <= max_bytes:
+
+    def fits() -> bool:
+        return len(_compact(out)) <= max_bytes
+
+    if fits():
         return out
+    out["truncated"] = True
+
     # Keep the start and the end of the timeline and drop lines from the middle: the most
     # lines that fit, found by bisection (the size grows with the number kept).
     def trimmed(keep: int) -> list[str]:
+        if keep >= len(lines):
+            return lines
         tail = keep // 3
         head = keep - tail
         cut = lines[head:len(lines) - tail]
-        marker = (f"... {len(cut)} lines omitted ({cut[0].split(' ', 1)[0]} to "
-                  f"{cut[-1].split(' ', 1)[0]}); read them with mode=messages")
+        marker = (f"... {len(cut)} lines omitted ({clip(cut[0].split(' ', 1)[0], 20)} to "
+                  f"{clip(cut[-1].split(' ', 1)[0], 20)}); read them with mode=messages")
         return lines[:head] + [marker] + lines[len(lines) - tail:]
 
-    out["truncated"] = True
-    low, high = 0, len(lines) - 1
+    low, high = 0, len(lines)
     while low < high:
         mid = (low + high + 1) // 2
         out["lines"] = trimmed(mid)
-        if len(_compact(out)) <= max_bytes:
+        if fits():
             low = mid
         else:
             high = mid - 1
     out["lines"] = trimmed(low)
-    return out
+    # The fixed fields alone can still be too large: give up detail in this order.
+    for shrink in (lambda: out.update(warnings=out["warnings"][:1]),
+                   lambda: out.update(counts={}),
+                   lambda: out.update(warnings=[]),
+                   lambda: out.update(contract=None if out["contract"] is None else
+                                      {k: out["contract"][k] for k in ("rdo", "pdo")}),
+                   lambda: out.update(label=None, path=_clip_left(out["path"], 60)),
+                   lambda: out.update(lines=[])):
+        if fits():
+            return out
+        shrink()
+    if fits():
+        return out
+    return {"path": _clip_left(out["path"], 60), "reason": out["reason"], "truncated": True,
+            "lines": [], "warnings": ["summary too large; read mode=messages or facts"]}
 
 
 def _sop_filter(sop) -> int | None:
@@ -443,15 +623,21 @@ def select(capture: Capture, sop=None, types=None, since: int | None = None,
     return out
 
 
-def _page(entries: list[Entry], limit: int) -> tuple[list[Entry], int | None]:
-    """Up to ``limit`` entries, extended to keep entries with equal times together, and the
-    ``since`` value of the next page."""
-    if len(entries) <= limit:
-        return entries, None
-    end = limit
-    while end < len(entries) and entries[end].t is not None and entries[end].t == entries[end - 1].t:
-        end += 1
-    return entries[:end], (entries[end].t if end < len(entries) else None)
+def _page(entries: list[Entry], after: int | None, limit: int) -> tuple[list[Entry], dict]:
+    """The first ``limit`` entries after line ``after``, and the paging fields.
+
+    Pages go by position in the file, not by time: marks and errors carry estimated times
+    that need not be in order, and several entries can share a millisecond. ``next_after``
+    is present only when more entries follow.
+    """
+    if after is not None and not isinstance(after, int):
+        raise ValueError("after must be a line number (next_after of the previous page)")
+    rest = [e for e in entries if after is None or e.line > after]
+    page = rest[:limit]
+    fields = {"count": len(page), "total": len(entries)}
+    if len(rest) > len(page):
+        fields["next_after"] = page[-1].line
+    return page, fields
 
 
 def _limit(mode: str, limit: int | None) -> int:
@@ -462,21 +648,22 @@ def _limit(mode: str, limit: int | None) -> int:
 
 
 def messages(capture: Capture, sop=None, types=None, since=None, limit=None,
-             include_goodcrc=False) -> dict:
+             include_goodcrc=False, after=None) -> dict:
     matched = select(capture, sop, types, since, include_goodcrc)
-    page, next_since = _page(matched, _limit("messages", limit))
-    return {"path": str(capture.path), "lines": [entry_line(e) for e in page],
-            "count": len(page), "total": len(matched), "next_since": next_since}
+    page, fields = _page(matched, after, _limit("messages", limit))
+    return {"path": str(capture.path), "lines": [entry_line(e) for e in page], **fields}
 
 
 def full(capture: Capture, sop=None, types=None, since=None, limit=None,
-         include_goodcrc=False) -> dict:
+         include_goodcrc=False, after=None) -> dict:
     matched = select(capture, sop, types, since, include_goodcrc, messages_only=True)
-    page, next_since = _page(matched, _limit("full", limit))
+    page, fields = _page(matched, after, _limit("full", limit))
     return {"path": str(capture.path),
-            "messages": [{"i": e.record.get("i"), "t": e.t, "sop": e.record.get("sop"),
-                          "wire": e.record.get("wire"), "decoded": e.decoded} for e in page],
-            "count": len(page), "total": len(matched), "next_since": next_since}
+            "messages": [{"line": e.line, "i": e.record.get("i"), "t": e.t,
+                          "sop": e.record.get("sop"),
+                          "wire": clip(e.record.get("wire"), MAX_HEX_CHARS),
+                          "decoded": e.decoded} for e in page],
+            **fields}
 
 
 _VDO_NAMES = {0: "id_header", 1: "cert_stat", 2: "product"}
@@ -510,21 +697,32 @@ def _identity_vdos(vdos: list[int], identity: dict, sop: int) -> list[dict]:
     return out
 
 
-def _contract_fact(negs: list[dict]) -> dict | None:
-    final = final_contract(negs)
-    if final is None:
-        return None
-    return {"request_index": negs.index(final), **contract_brief(final)}
+FACTS_MAX_BYTES = 8192
+# How many of each kind facts keeps, tried in order until the result fits FACTS_MAX_BYTES:
+# (Source_Capabilities, Requests, Discover Identity ACKs). The final contract's
+# Source_Capabilities and Request, and the latest ACK of each SOP and sender, are kept on
+# top of these counts while the ACK cap allows.
+_FACTS_KEEP = ((4, 8, 8), (2, 4, 4), (1, 2, 2), (1, 1, 1), (1, 1, 0))
 
 
-def facts(capture: Capture) -> dict:
-    """The objects a register cross-check needs, each with its hex."""
+def _keep(items: list, n: int, must: set[int]) -> list[int]:
+    """Indexes of the last ``n`` items plus the ``must`` indexes, in order."""
+    return sorted(set(range(max(len(items) - n, 0), len(items))) | must)
+
+
+def facts(capture: Capture, max_bytes: int = FACTS_MAX_BYTES) -> dict:
+    """The objects a register cross-check needs, each with its hex, within ``max_bytes``.
+
+    A long capture keeps the latest Source_Capabilities, Requests, and Discover Identity
+    ACKs, always including the final contract's Source_Capabilities and Request; ``omitted``
+    counts what was left out.
+    """
     negs = negotiations(capture)
-    caps = []
-    identity: dict[str, dict[str, list]] = {}
+    caps: list[dict] = []
+    acks: list[tuple[str, str, dict]] = []
     for e in capture.messages:
         d = e.decoded or {}
-        if e.goodcrc:
+        if e.goodcrc or e.retry:
             continue
         if e.msg in _CAPABILITIES and e.sop == 0:
             words = _objects(e)
@@ -542,29 +740,80 @@ def facts(capture: Capture) -> dict:
                    "wire": e.record.get("wire"), "header": (e.record.get("wire") or "")[:4],
                    "vdm_header": words[0] if words else None, "vdo_count": len(vdos),
                    "vdos": _identity_vdos(vdos, vdm.get("identity") or {}, e.sop or 0)}
-            sop_name = e.record.get("sop", "SOP")
-            identity.setdefault(sop_name, {}).setdefault(sender(e), []).append(ack)
-    return {
-        "path": str(capture.path),
-        "label": capture.header.get("label"),
-        "source_capabilities": caps,
-        "requests": negs,
-        "contract": _contract_fact(negs),
-        "discover_identity_acks": identity,
-        "warnings": warnings(capture, negs),
-    }
+            acks.append((e.record.get("sop", "SOP"), sender(e), ack))
+
+    final = final_contract(negs)
+    must_req = {negs.index(final)} if final is not None else set()
+    must_caps = {k for k, c in enumerate(caps)
+                 if final is not None and c["i"] == final.get("source_capabilities_i")}
+    latest_per_group = {}
+    for k, (sop_name, who, _) in enumerate(acks):
+        latest_per_group[(sop_name, who)] = k
+    warns = warnings(capture, negs)
+    out: dict = {}
+    for keep_caps, keep_reqs, keep_acks in _FACTS_KEEP:
+        cap_idx = _keep(caps, keep_caps, must_caps)
+        req_idx = _keep(negs, keep_reqs, must_req)
+        # The latest ACK of each SOP and sender first, then the most recent others.
+        chosen = sorted(latest_per_group.values(), reverse=True)[:keep_acks]
+        for k in range(len(acks) - 1, -1, -1):
+            if len(chosen) >= keep_acks:
+                break
+            if k not in chosen:
+                chosen.append(k)
+        ack_idx = sorted(chosen)
+        identity: dict[str, dict[str, list]] = {}
+        for k in ack_idx:
+            sop_name, who, ack = acks[k]
+            identity.setdefault(sop_name, {}).setdefault(who, []).append(ack)
+        requests = [negs[k] for k in req_idx]
+        contract = None
+        if final is not None:
+            contract = {"request_index": requests.index(final), **contract_brief(final)}
+        out = {
+            "path": str(capture.path),
+            "label": _scalar(capture.header.get("label"), 80),
+            "source_capabilities": [caps[k] for k in cap_idx],
+            "requests": requests,
+            "contract": contract,
+            "discover_identity_acks": identity,
+            "omitted": {"source_capabilities": len(caps) - len(cap_idx),
+                        "requests": len(negs) - len(req_idx),
+                        "discover_identity_acks": len(acks) - len(ack_idx)},
+            "warnings": [clip(w) for w in warns[:SUMMARY_MAX_WARNINGS]],
+        }
+        out["truncated"] = any(out["omitted"].values())
+        if len(_compact(out)) <= max_bytes:
+            return out
+    out["truncated"] = True
+    out["warnings"] = out["warnings"][:1] + ["facts exceed their size bound even at the "
+                                             "smallest selection; read mode=full"]
+    return out
 
 
 def read(path: str | Path, mode: str = "summary", sop=None, types=None, since=None,
-         limit=None, include_goodcrc: bool = False) -> dict:
-    """Load ``path`` and render it in ``mode``."""
+         limit=None, include_goodcrc: bool = False, after: int | None = None,
+         extra: dict | None = None) -> dict:
+    """Load ``path`` and render it in ``mode``; ``extra`` fields are added to the result
+    (inside the size bound for ``summary``).
+
+    Raises ValueError for a file that cannot be read as a capture, including one whose
+    records are malformed in a way the loader's checks did not catch.
+    """
     if mode not in MODES:
         raise ValueError(f"mode must be one of {', '.join(MODES)}")
     capture = load_capture(path)
-    if mode == "summary":
-        return summary(capture)
-    if mode == "facts":
-        return facts(capture)
-    if mode == "messages":
-        return messages(capture, sop, types, since, limit, include_goodcrc)
-    return full(capture, sop, types, since, limit, include_goodcrc)
+    try:
+        if mode == "summary":
+            return summary(capture, extra=extra)
+        if mode == "facts":
+            out = facts(capture)
+        elif mode == "messages":
+            out = messages(capture, sop, types, since, limit, include_goodcrc, after)
+        else:
+            out = full(capture, sop, types, since, limit, include_goodcrc, after)
+        out.update(extra or {})
+        return out
+    except (AttributeError, TypeError, KeyError, IndexError) as exc:
+        raise ValueError(f"{capture.path}: malformed capture file "
+                         f"({type(exc).__name__}: {exc})") from exc

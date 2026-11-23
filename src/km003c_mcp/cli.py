@@ -3,6 +3,12 @@
 ``summarize`` and ``facts`` read files only and never open the meter. ``record`` claims the
 meter for the length of the capture and prints ``capturing <path>`` once capturing has
 begun, so a script can start it in the background and wait for that line.
+
+Exit codes: 0 success; 1 a capture that ended with an error, or a meter error; 2 an
+unreadable file or a bad argument; 3 ``record`` reached its timeout before its stop
+condition (``--stop-on`` or ``--stop-after-messages``) was met. Ctrl-C or SIGTERM stops
+the capture with footer reason ``manual`` within about 0.2 s (once a start in progress has
+finished) and exits as for any other stop.
 """
 
 from __future__ import annotations
@@ -11,9 +17,14 @@ import argparse
 import json
 import signal
 import sys
+import threading
 
 from . import capture_read
 from .capture import STOP_ON
+
+EXIT_NOT_MET = 3
+# How often record checks for Ctrl-C or SIGTERM while it waits for the capture to stop.
+WAIT_STEP_S = 0.2
 
 
 def _summary_text(s: dict) -> str:
@@ -42,46 +53,63 @@ def _record(args: argparse.Namespace) -> int:
     if provenance is not None and not isinstance(provenance, dict):
         raise ValueError("--provenance must be a JSON object")
 
-    def interrupted(signum, frame):
-        raise KeyboardInterrupt
+    # Ctrl-C and SIGTERM only set a flag that the wait loop checks. Raising from the handler
+    # instead could interrupt the main thread inside a lock acquire in Condition.wait and
+    # leave the recorder's lock held, so the cleanup below would hang.
+    stop = threading.Event()
 
-    previous_handler = signal.signal(signal.SIGTERM, interrupted)
-    service = Km003cService(idle_release_s=0)
+    def interrupted(signum, frame):
+        stop.set()
+
+    previous = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        return _record_with(args, provenance, Km003cService, stop)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def _record_with(args, provenance, service_class, stop: threading.Event) -> int:
+    service = service_class(idle_release_s=0)
     recorder = service.recorder
     try:
-        try:
-            monitor = recorder.start_pd(
-                args.path, args.label, provenance, stop_on=args.stop_on,
-                stop_after_messages=args.stop_after_messages, settle_ms=args.settle_ms,
-                timeout_s=args.timeout, status_interval_ms=args.status_interval_ms)
-        except Exception:
-            if recorder.capture_path is not None:
-                print(f"capture file {recorder.capture_path}", file=sys.stderr, flush=True)
-            raise
+        monitor = recorder.start_pd(
+            args.path, args.label, provenance, stop_on=args.stop_on,
+            stop_after_messages=args.stop_after_messages, settle_ms=args.settle_ms,
+            timeout_s=args.timeout, status_interval_ms=args.status_interval_ms)
         print(f"capturing {recorder.capture_path}", flush=True)
         print(f"pd_monitor {monitor.outcome}; stop_on {args.stop_on}; timeout {args.timeout:g} s; "
               "Ctrl-C stops", flush=True)
-        try:
-            while not recorder.wait_pd(0.5):
-                pass
-        except KeyboardInterrupt:
-            recorder.stop_pd()
+        while not recorder.wait_pd(WAIT_STEP_S):
+            if stop.is_set():
+                print("stopping: interrupted", file=sys.stderr, flush=True)
+                break
+    except BaseException:
+        if recorder.capture_path is not None:
+            print(f"capture file {recorder.capture_path}", file=sys.stderr, flush=True)
+        raise
     finally:
-        service.shutdown()
-        signal.signal(signal.SIGTERM, previous_handler)
+        service.shutdown()  # stops a running capture with reason manual and releases the meter
     path = recorder.capture_path
     if path is None:
         return 1
     summary = capture_read.read(path, "summary")
     print(json.dumps(summary, indent=1) if args.json else _summary_text(summary), flush=True)
-    return 1 if summary.get("reason") == "error" else 0
+    if summary.get("reason") == "error":
+        return 1
+    if summary.get("reason") == "timeout" and (args.stop_on != "none"
+                                                or args.stop_after_messages is not None):
+        return EXIT_NOT_MET
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="km003c-capture",
         description="Record USB PD captures from a ChargerLab POWER-Z KM003C, or read saved "
-                    "capture files (summarize and facts never touch the meter).")
+                    "capture files (summarize and facts never touch the meter).",
+        epilog="Exit codes: 0 success; 1 the capture ended with an error; 2 unreadable file "
+               "or bad argument; 3 record timed out before its stop condition was met.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     rec = sub.add_parser("record", help="capture PD traffic to a new capture file")
@@ -108,6 +136,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "record":
             return _record(args)
+    except (OSError, ValueError) as exc:
+        print(f"km003c-capture: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - report meter errors without a traceback
+        print(f"km003c-capture: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    try:
         capture = capture_read.load_capture(args.path)
         if args.command == "facts":
             print(json.dumps(capture_read.facts(capture), indent=1))
@@ -115,12 +150,10 @@ def main(argv: list[str] | None = None) -> int:
         summary = capture_read.summary(capture, args.max_bytes)
         print(json.dumps(summary, indent=1) if args.json else _summary_text(summary))
         return 0
-    except (OSError, ValueError) as exc:
-        print(f"km003c-capture: {exc}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - any failure to read the file is exit 2
+        print(f"km003c-capture: cannot read {args.path}: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
         return 2
-    except Exception as exc:  # noqa: BLE001 - report meter errors without a traceback
-        print(f"km003c-capture: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1
 
 
 if __name__ == "__main__":

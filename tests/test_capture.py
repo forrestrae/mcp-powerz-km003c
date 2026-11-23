@@ -192,3 +192,32 @@ def test_stop_after_messages():
     t = StopTracker("none", stop_after_messages=2)
     assert t.feed(0, b"", "Accept") is None
     assert t.feed(1, b"", "Vendor_Defined") == "messages"
+
+
+# --- retransmissions ------------------------------------------------------------------------
+
+REQUEST = bytes.fromhex("82102cb18441")
+GOODCRC_FROM_SOURCE = bytes.fromhex("6101")
+ACCEPT = bytes.fromhex("a303")
+
+
+def test_retransmission_counts_once_toward_stop_after_messages(tmp_path):
+    s = session(tmp_path, stop_after_messages=2)
+    # The Request goes out twice before its GoodCRC: one message, not two.
+    assert s.ingest(status(1010) + message(1000, 0, REQUEST) + message(1001, 0, REQUEST)
+                    + message(1002, 0, GOODCRC_FROM_SOURCE)) is None
+    assert s.tracker.messages == 1
+    assert s.ingest(status(1020) + message(1015, 0, ACCEPT)) == "messages"
+    s.finish("messages")
+    footer = records(tmp_path / "c.jsonl")[-1]
+    assert footer["messages"] == 2 and footer["counts"]["Request"] == 2
+
+
+def test_same_bytes_after_a_goodcrc_are_a_new_message():
+    from km003c_mcp.capture import RetryFilter
+    f = RetryFilter()
+    assert f.is_retry(0, REQUEST, False) is False
+    assert f.is_retry(0, REQUEST, False) is True
+    assert f.is_retry(1, REQUEST, False) is False  # another SOP
+    assert f.is_retry(0, GOODCRC_FROM_SOURCE, True) is False
+    assert f.is_retry(0, REQUEST, False) is False

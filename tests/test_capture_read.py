@@ -184,19 +184,36 @@ def test_messages_filters():
         cr.read(GOLDEN, "messages", sop="SOP'''")
 
 
-def test_messages_paging_keeps_equal_times_together():
-    first = cr.read(GOLDEN, "messages", limit=4, include_goodcrc=True)
-    # Entry 4 (t=14637552) is followed by its GoodCRC at the same time; both stay together.
-    assert first["count"] == 5 and first["total"] == 19
-    assert first["next_since"] == 14637555
-    rest = cr.read(GOLDEN, "messages", since=first["next_since"], limit=500,
-                   include_goodcrc=True)
-    assert first["count"] + rest["count"] == 19 and rest["next_since"] is None
+def _walk(path, mode="messages", **kwargs):
+    """Every page of a read, following next_after."""
+    pages, after = [], None
+    while True:
+        page = cr.read(path, mode, after=after, **kwargs)
+        pages.append(page)
+        if "next_after" not in page:
+            return pages
+        assert page["count"] > 0
+        after = page["next_after"]
+
+
+def test_messages_paging_walks_the_golden_file_once():
+    pages = _walk(GOLDEN, limit=4, include_goodcrc=True)
+    lines = [line for page in pages for line in page["lines"]]
+    assert len(lines) == 19 and len(set(lines)) == 19 and len(pages) == 5
+    assert all(page["total"] == 19 for page in pages)
+
+
+def test_after_must_be_a_line_number():
+    with pytest.raises(ValueError, match="after must be a line number"):
+        cr.read(GOLDEN, "messages", after="14637555")
 
 
 def test_full_mode_default_limit_and_hex_beside_decode():
     out = cr.read(GOLDEN, "full", include_goodcrc=True)
-    assert out["count"] == 16 and out["next_since"] is None
+    assert out["count"] == 16 and "next_after" not in out
+    first_pd = next(n for n, line in enumerate(GOLDEN.read_text().splitlines(), 1)
+                    if '"type":"pd"' in line)
+    assert out["messages"][0]["line"] == first_pd
     out = cr.read(GOLDEN, "full", types=["Request"])
     (msg,) = out["messages"]
     assert msg["wire"] == "82102cb18441" and msg["decoded"]["objects"] == ["4184b12c"]
@@ -236,3 +253,219 @@ def test_identity_vdos_of_a_dual_role_partner():
     out = cr._identity_vdos(vdos, decode_identity(vdos, 0), 0)
     assert [v["name"] for v in out] == ["id_header", "cert_stat", "product", "ufp", "pad", "dfp"]
     assert out[5]["hex"] == "22000000" and out[5]["decoded"] is not None
+
+
+# --- retransmissions and Soft_Reset ---------------------------------------------------------
+
+def _pd(i, t, wire, sop="SOP"):
+    code = {"SOP": 0, "SOP'": 1}[sop]
+    head = bytes([0x80 | ((len(wire) // 2 + 5) & 0x3F)]) + t.to_bytes(4, "little") + bytes([code])
+    return {"type": "pd", "i": i, "t_meter_ms": t, "sop": sop, "wire": wire,
+            "raw_event": head.hex() + wire}
+
+
+HEADER = {"type": "header", "format": "km003c-capture", "version": 1}
+CAPS = "a1412c9181092cd102002cb10400d6410600"
+
+
+def test_retransmitted_request_appears_once_in_facts(tmp_path):
+    path = _write(tmp_path, [
+        HEADER, _pd(0, 1000, CAPS), _pd(1, 1001, "4100"),
+        _pd(2, 1005, "82102cb18441"), _pd(3, 1006, "82102cb18441"), _pd(4, 1007, "6101"),
+        _pd(5, 1009, "a303"), _pd(6, 1010, "4102"), _pd(7, 1200, "a605"), _pd(8, 1201, "4104"),
+    ])
+    f = cr.read(path, "facts")
+    assert len(f["requests"]) == 1 and f["requests"][0]["ps_rdy_t"] == 1200
+    lines = cr.read(path)["lines"]
+    assert lines[1].startswith("t=1005 SOP Request") and "(retry)" not in lines[1]
+    assert lines[2].startswith("t=1006 SOP Request pos 4, 3.0 A (retry) [")
+
+
+def test_soft_reset_ends_the_negotiation_in_progress(tmp_path):
+    path = _write(tmp_path, [
+        HEADER, _pd(0, 1000, CAPS), _pd(1, 1001, "4100"),
+        _pd(2, 1005, "82102cb18441"), _pd(3, 1006, "6101"),
+        _pd(4, 1008, "ad01"), _pd(5, 1009, "4102"),  # Soft_Reset from the source
+        _pd(6, 1010, "a303"), _pd(7, 1011, "4104"),  # an Accept that answers nothing now
+        _pd(8, 1200, "a605"), _pd(9, 1201, "4106"),
+    ])
+    (req,) = cr.read(path, "facts")["requests"]
+    assert req["outcome"] is None and req["ps_rdy_t"] is None
+    assert cr.read(path)["contract"] is None
+
+
+# --- file checks and long fields ------------------------------------------------------------
+
+def test_reader_requires_a_regular_file(tmp_path):
+    with pytest.raises(ValueError, match="not a regular file"):
+        cr.read(tmp_path)
+    with pytest.raises(ValueError, match="no such file"):
+        cr.read(tmp_path / "missing.jsonl")
+
+
+def test_reader_refuses_a_file_over_the_size_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(cr, "MAX_FILE_BYTES", 1000)
+    (tmp_path / "big.jsonl").write_text(GOLDEN.read_text())
+    with pytest.raises(ValueError, match="this reader loads at most 1000 bytes"):
+        cr.read(tmp_path / "big.jsonl")
+
+
+def test_long_mark_error_and_wire_are_cut_with_an_indication(tmp_path):
+    long_wire = "a303" + "00" * 400
+    path = _write(tmp_path, [
+        HEADER,
+        {"type": "status", "t_host": 1.0, "t_meter_ms": 1000, "vbus_mv": 5000},
+        {"type": "mark", "t_host": 1.0, "text": "m" * 5000},
+        {"type": "error", "t_host": 1.0, "kind": "ProtocolError", "message": "e" * 5000},
+        _pd(0, 1001, long_wire),
+    ])
+    lines = cr.read(path, "messages")["lines"]
+    assert all(len(line) < 600 for line in lines)
+    assert "(4800 more chars)" in lines[0] and "(4800 more chars)" in lines[1]
+    assert "more chars)]" in lines[2]
+    (msg,) = cr.read(path, "full")["messages"]
+    assert len(msg["wire"]) < 200 and msg["wire"].endswith("more chars)")
+
+
+# --- malformed records ----------------------------------------------------------------------
+
+STATUS = {"type": "status", "t_host": 1.0, "t_meter_ms": 1000, "vbus_mv": 5000}
+
+
+@pytest.mark.parametrize("bad, problem", [
+    ({**HEADER, "meter": "KM003C"}, "header meter is not an object"),
+    ({**HEADER, "pd_monitor": "accepted"}, "header pd_monitor is not an object"),
+    ({**HEADER, "stop": "contract"}, "header stop is not an object"),
+    ({"type": "conn", "t_meter_ms": "1000", "code": 17, "event": "connect",
+      "raw_event": "45"}, "conn record has a bad t_meter_ms"),
+    ({"type": "mark", "t_host": "now", "text": "x"}, "mark record has a bad t_host"),
+    ({"type": "error", "t_host": 1.0, "kind": 5, "message": "x"}, "error record has a bad kind"),
+    ({"type": "pd", "i": 0, "t_meter_ms": 1001, "sop": "SOP", "wire": "a303",
+      "raw_event": 12}, "pd record has a bad raw_event"),
+    ({"type": "pd", "i": 0, "t_meter_ms": 1001, "sop": "SOP", "wire": "a303",
+      "raw_event": "zz"}, "pd record has a bad raw_event"),
+    ({"type": "pd", "i": 0, "t_meter_ms": 1001, "sop": "SOP", "wire": None},
+     "pd record has a bad wire"),
+    ({"type": "status", "t_host": 1.0, "t_meter_ms": 2.5, "vbus_mv": 5000},
+     "status record has a bad t_meter_ms"),
+    ({"type": "footer", "reason": "manual", "vbus_mv": "flat"}, "footer vbus_mv is malformed"),
+    ({"type": "footer", "reason": "manual", "vbus_mv": {"first": "0"}},
+     "footer vbus_mv is malformed"),
+    ({"type": "footer", "reason": ["manual"]}, "footer record has a bad reason"),
+    ({"type": 7}, "unknown record type"),
+])
+def test_malformed_records_are_flagged_not_raised(tmp_path, capsys, bad, problem):
+    lines = [bad, STATUS] if bad.get("type") == "header" else [HEADER, STATUS, bad]
+    path = _write(tmp_path, lines + [_pd(1, 1002, "a605")])
+    from km003c_mcp.cli import main
+    for mode in cr.MODES:
+        out = cr.read(path, mode)
+        assert "path" in out
+    assert any(problem in w for w in cr.read(path)["warnings"])
+    assert cr.read(path)["lines"][-1].startswith("t=1002 SOP PS_RDY")
+    assert main(["summarize", str(path)]) == 0 and main(["facts", str(path)]) == 0
+
+
+def test_cli_exits_2_for_an_unreadable_file(tmp_path, capsys):
+    from km003c_mcp.cli import main
+    (tmp_path / "x.jsonl").write_text('"just a string"\n')
+    assert main(["summarize", str(tmp_path / "x.jsonl")]) == 2
+    assert main(["facts", str(tmp_path)]) == 2
+    assert "cannot read" in capsys.readouterr().err
+
+
+# --- paging by position ---------------------------------------------------------------------
+
+# Marks carry host-estimated times that can run ahead of the meter's message times.
+OUT_OF_ORDER = [
+    HEADER,
+    {"type": "status", "t_host": 100.0, "t_meter_ms": 980, "vbus_mv": 5000},
+    _pd(0, 990, "a303"),
+    {"type": "mark", "t_host": 100.07, "text": "stimulus"},  # estimated t=1050
+    _pd(1, 1020, "a605"),
+    _pd(2, 1040, "a303"),
+    _pd(3, 1055, "a605"),
+]
+
+
+@pytest.mark.parametrize("limit", [1, 2])
+def test_paging_by_position_neither_repeats_nor_skips(tmp_path, limit):
+    path = _write(tmp_path, OUT_OF_ORDER)
+    pages = _walk(path, limit=limit)
+    lines = [line for page in pages for line in page["lines"]]
+    assert [line.split(" ")[0] for line in lines] == ["t=990", "t~1050", "t=1020", "t=1040",
+                                                      "t=1055"]
+    assert all("next_after" in page for page in pages[:-1])
+    assert "next_after" not in pages[-1]
+
+
+def test_paging_includes_a_mark_without_a_time(tmp_path):
+    # No status record: the mark's time cannot be estimated.
+    path = _write(tmp_path, [HEADER, _pd(0, 990, "a303"),
+                             {"type": "mark", "t_host": 1.0, "text": "no time"},
+                             _pd(1, 1020, "a605")])
+    lines = [line for page in _walk(path, limit=1) for line in page["lines"]]
+    assert lines[1] == "t~? mark: no time" and len(lines) == 3
+    # since is a window: it keeps timed entries at or after it and drops the untimed mark.
+    assert [line.split(" ")[0] for line in cr.read(path, "messages", since=1000)["lines"]] == [
+        "t=1020"]
+
+
+# --- summary bound with oversized fixed fields ----------------------------------------------
+
+def _oversized(tmp_path, body):
+    deep = tmp_path
+    for k in range(4):
+        deep = deep / ("d" * 80 + str(k))
+    deep.mkdir(parents=True)
+    header = {**HEADER, "label": "L" * 10_000, "meter": {"fw_version": "F" * 10_000},
+              "pd_monitor": {"outcome": "O" * 10_000}}
+    bad = [{"type": "pd", "t_meter_ms": k, "wire": "zz"} for k in range(40)]
+    return _write(deep, [header, *bad, *body], name="c" * 100 + ".jsonl")
+
+
+@pytest.mark.parametrize("body", [[], [_pd(k, 1000 + k, CAPS) for k in range(200)]],
+                         ids=["no lines", "many lines"])
+def test_summary_bound_holds_with_oversized_fields(tmp_path, body):
+    path = _oversized(tmp_path, body)
+    extra = {"running": False, "stopped": True}
+    out = cr.read(path, "summary", extra=extra)
+    assert size(out) <= cr.SUMMARY_MAX_BYTES and out["truncated"] is bool(body)
+    assert out["stopped"] is True and out["running"] is False
+    assert out["path"].endswith(".jsonl") and out["path"].startswith("...")
+    assert "more chars" in out["label"] and "more chars" in out["meter_fw"]
+    assert len(out["warnings"]) <= cr.SUMMARY_MAX_WARNINGS
+
+
+def test_summary_with_no_lines_is_not_truncated():
+    out = cr.summary(cr.Capture(GOLDEN, HEADER, None, [], []))
+    assert out["lines"] == [] and out["truncated"] is False
+
+
+# --- facts bound ----------------------------------------------------------------------------
+
+def test_facts_stay_within_their_bound_and_keep_the_contract(tmp_path):
+    golden = records(GOLDEN)
+    caps = next(r for r in golden if r.get("msg") == "Source_Capabilities")
+    body = [r for r in golden[1:-1]]
+    # 50 more Source_Capabilities and Requests that never complete, before the real ones.
+    noise = []
+    for k in range(50):  # each acknowledged, so none is a retransmission
+        noise += [{**caps, "i": 1000 + 4 * k, "t_meter_ms": 100 + 4 * k},
+                  _pd(1001 + 4 * k, 101 + 4 * k, "4100"),
+                  _pd(1002 + 4 * k, 102 + 4 * k, "82102cb18441"),
+                  _pd(1003 + 4 * k, 103 + 4 * k, "6101")]
+    path = _write(tmp_path, [golden[0], *noise, *body, golden[-1]])
+    f = cr.read(path, "facts")
+    assert size(f) <= cr.FACTS_MAX_BYTES and f["truncated"] is True
+    assert f["omitted"]["source_capabilities"] >= 40 and f["omitted"]["requests"] >= 40
+    contract = f["requests"][f["contract"]["request_index"]]
+    assert contract["ps_rdy_t"] == 14637780 and contract["rdo"]["hex"] == "4184b12c"
+    assert any(c["i"] == contract["source_capabilities_i"] for c in f["source_capabilities"])
+    # Both SOP and SOP' identity ACKs survive.
+    assert set(f["discover_identity_acks"]) == {"SOP", "SOP'"}
+
+
+def test_facts_of_a_short_capture_omit_nothing():
+    f = cr.read(GOLDEN, "facts")
+    assert f["truncated"] is False and set(f["omitted"].values()) == {0}

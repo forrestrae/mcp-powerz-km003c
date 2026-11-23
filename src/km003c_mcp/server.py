@@ -8,6 +8,7 @@ import functools
 import inspect
 import logging
 import os
+import signal
 import threading
 import time
 from collections import Counter
@@ -485,16 +486,19 @@ def build_tools(service: Km003cService, enable_trigger: bool | None = None) -> S
         """Stop the stream and return its statistics."""
         return service.recorder.stop_stream().to_dict()
 
-    def read_capture(path, *args) -> dict:
-        """Read a capture file; when it is this session's capture, say whether it still runs."""
-        out = capture_read.read(path, *args)
-        state = service.recorder.pd_capture_state()
-        if state["path"] == out["path"]:
-            out["running"] = state["running"]
-        return out
+    def read_capture(path, *args, extra: dict | None = None) -> dict:
+        """Read a capture file; when it is this session's capture, say whether it still runs.
 
-    def capture_summary(path) -> dict:
-        return read_capture(path, "summary")
+        The added fields count toward the summary's size bound.
+        """
+        extra = dict(extra or {})
+        state = service.recorder.pd_capture_state()
+        if state["path"] is not None and state["path"] == str(capture_read.resolve_path(path)):
+            extra["running"] = state["running"]
+        return capture_read.read(path, *args, extra=extra)
+
+    def capture_summary(path, extra: dict | None = None) -> dict:
+        return read_capture(path, "summary", extra=extra)
 
     def current_capture() -> str:
         path = service.recorder.capture_path
@@ -534,7 +538,7 @@ def build_tools(service: Km003cService, enable_trigger: bool | None = None) -> S
         """Wait up to timeout_s for the running capture to stop, then return its summary.
 
         running is True in the result when the capture is still going; reason says why it
-        stopped. Waiting does not stop the capture.
+        stopped. Waiting does not stop the capture. timeout_s is clamped to 0 to 86400.
         """
         service.recorder.wait_pd(timeout_s)
         return capture_summary(current_capture())
@@ -550,14 +554,14 @@ def build_tools(service: Km003cService, enable_trigger: bool | None = None) -> S
         """Stop the running PD capture and return its summary (stopped is False when none ran;
         the summary is then the last capture's)."""
         stopped = service.recorder.stop_pd() is not None
-        return {"stopped": stopped, **capture_summary(current_capture())}
+        return capture_summary(current_capture(), extra={"stopped": stopped})
 
     @safe
     def pd_capture_read(path: str | None = None,
                         mode: Literal["summary", "messages", "facts", "full"] = "summary",
                         sop: str | None = None, types: list[str] | None = None,
-                        since: int | None = None, limit: int | None = None,
-                        include_goodcrc: bool = False) -> dict:
+                        since: int | None = None, after: int | None = None,
+                        limit: int | None = None, include_goodcrc: bool = False) -> dict:
         """Read a capture file; never touches the meter. Without path: the running or last
         capture of this session.
 
@@ -565,17 +569,20 @@ def build_tools(service: Km003cService, enable_trigger: bool | None = None) -> S
         "t=84002 SOP Request pos 4, 3.0 A [8210 2cb18441]", connection events and marks,
         counts, VBUS first/last/min/max (mV), the final contract, and warnings from the
         sanity rules (no negotiation, PD monitoring inactive, capture started late).
-        messages: the same lines, filtered and paged (limit default 50); pass next_since as
-        since for the next page. facts: Source_Capabilities PDOs, Request RDOs with their
+        messages: the same lines, filtered and paged (limit default 50): pass a page's
+        next_after as after for the next page; next_after is absent on the last page. facts: Source_Capabilities PDOs, Request RDOs with their
         object position, Accept and PS_RDY times, and Discover Identity ACKs grouped by SOP
-        and sender, each value beside its hex. full: complete decodes (limit default 20).
+        and sender, each value beside its hex; at most about 8 KB, with omitted counting what
+        a long capture left out. full: complete decodes (limit default 20).
         Filters: sop ("SOP", "SOP'", "SOP''"), types (message type or VDM command names,
         such as Request or Discover_Identity; also connect, disconnect, mark, error), since
-        (meter ms), include_goodcrc. Times are the meter's uptime in ms. running appears
-        when the file is this session's capture.
+        (keeps entries at or after that meter time in ms; marks without a time drop out),
+        include_goodcrc. after is a line number in the file (exclusive) and is how pages
+        advance; since only narrows the window. Times are the meter's uptime in ms. running
+        appears when the file is this session's capture.
         """
         return read_capture(path or current_capture(), mode, sop, types, since, limit,
-                            include_goodcrc)
+                            include_goodcrc, after)
 
     @safe
     def device_release() -> dict:
@@ -667,6 +674,35 @@ tools = build_tools(service)
 mcp = build_server(tools)
 
 
+# After SIGTERM the server exits this long after starting its cleanup, even if a step hangs.
+SIGTERM_EXIT_DEADLINE_S = 10.0
+
+
+def install_sigterm_handler(service: Km003cService, exit_fn: Callable[[int], None] = os._exit,
+                            deadline_s: float = SIGTERM_EXIT_DEADLINE_S) -> None:
+    """On SIGTERM, stop a running capture and stream, release the meter, and exit 0.
+
+    A running capture gets its footer with reason ``manual``. The cleanup runs on its own
+    thread, because the signal can arrive while the main thread holds a lock the cleanup
+    needs; the process exits when it is done, or after ``deadline_s`` at the latest.
+    """
+    def stop_and_exit() -> None:
+        try:
+            service.shutdown()
+        finally:
+            exit_fn(0)
+
+    def on_sigterm(signum, frame) -> None:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        threading.Thread(target=stop_and_exit, name="km003c-sigterm", daemon=True).start()
+        watchdog = threading.Timer(deadline_s, exit_fn, args=(0,))
+        watchdog.daemon = True
+        watchdog.start()
+
+    signal.signal(signal.SIGTERM, on_sigterm)
+
+
 def main() -> None:
     atexit.register(service.shutdown)
+    install_sigterm_handler(service)
     mcp.run()

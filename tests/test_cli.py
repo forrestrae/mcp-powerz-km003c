@@ -62,3 +62,17 @@ def test_record_announces_the_path_and_stops_on_contract(monkeypatch, tmp_path, 
     assert recs[0]["meter"]["fw_version"] == "2.0.0"
     assert recs[0]["provenance"] == {"charger": "Apple 140 W"}
     assert recs[-1]["reason"] == "contract"
+
+
+def test_record_exits_3_when_the_condition_is_not_met(monkeypatch, tmp_path, capsys):
+    from capture_bench import s3_until
+    monkeypatch.setenv("KM003C_PD_POLL_MS", "1")
+    real = srv.Km003cService
+    payloads = s3_until("82102cb18441")  # ends before Accept and PS_RDY
+    monkeypatch.setattr(srv, "Km003cService", lambda **kw: real(
+        transport_factory=lambda: MeterFake(pd_payloads=payloads), **kw))
+    code = main(["record", "--stop-on", "contract", "--timeout", "0.3",
+                 str(tmp_path / "t.jsonl")])
+    assert code == 3 and records(tmp_path / "t.jsonl")[-1]["reason"] == "timeout"
+    # Without a stop condition, reaching the timeout is the expected end.
+    assert main(["record", "--timeout", "0.3", str(tmp_path / "u.jsonl")]) == 0

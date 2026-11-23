@@ -153,13 +153,38 @@ def is_discover_identity_ack(wire: bytes) -> bool:
     return bool(vdm & 1 << 15) and vdm & 0x1F == 1 and (vdm >> 6) & 3 == 1
 
 
+class RetryFilter:
+    """Recognizes retransmissions.
+
+    A port that gets no GoodCRC sends the same message again: the same bytes, so the same
+    MessageID, from the same sender (power and data role bits, or cable plug) on the same
+    SOP. A GoodCRC on that SOP ends the wait, so a later message with the same bytes is new.
+    Feed every message, GoodCRC included, in capture order.
+    """
+
+    def __init__(self) -> None:
+        self._last: dict[tuple[int | None, int], bytes] = {}
+
+    def is_retry(self, sop: int | None, wire: bytes, goodcrc: bool) -> bool:
+        if goodcrc:
+            for key in [k for k in self._last if k[0] == sop]:
+                del self._last[key]
+            return False
+        if len(wire) < 2:
+            return False
+        key = (sop, int.from_bytes(wire[:2], "little") & 0x0120)
+        retry = self._last.get(key) == wire
+        self._last[key] = wire
+        return retry
+
+
 class StopTracker:
     """Watches non-GoodCRC messages for the capture's stop condition.
 
     ``contract``: a PS_RDY on SOP after an Accept of a Request (or EPR_Request); a Reject,
     Wait, Soft_Reset, or Not_Supported in between starts over. ``identity``: a Discover
     Identity ACK on SOP, from either port. ``stop_after_messages`` counts non-GoodCRC
-    messages on every SOP.
+    messages on every SOP. The session leaves retransmissions out (see RetryFilter).
     """
 
     def __init__(self, stop_on: str = "none", stop_after_messages: int | None = None) -> None:
@@ -238,6 +263,7 @@ class CaptureSession:
         self._wall = wall
         self.deadline = clock() + timeout_s
         self.tracker = StopTracker(stop_on, stop_after_messages)
+        self.retries = RetryFilter()
         self.counts: Counter[str] = Counter()
         self.vbus = VbusStats()
         self.pd_index = 0
@@ -248,6 +274,8 @@ class CaptureSession:
         self.settle_until: int | None = None
         self.reason: str | None = None
         self.header_written = False
+        # Why the last payload passed to ingest() failed to parse, or None.
+        self.parse_error: str | None = None
         self._last_status_t: int | None = None
 
     @property
@@ -283,6 +311,7 @@ class CaptureSession:
         """
         t_host = self._wall()
         split = split_pd(payload)
+        self.parse_error = split.error
         meter_t = None
         status = None
         if len(split.status_raw) == PD_STATUS_SIZE:
@@ -324,7 +353,7 @@ class CaptureSession:
         self.pd_index += 1
         msg = header["msg"]
         self.counts[msg or "invalid"] += 1
-        if msg == "GoodCRC":
+        if self.retries.is_retry(sop, event.wire, msg == "GoodCRC") or msg == "GoodCRC":
             return
         reason = self.tracker.feed(sop, event.wire, msg)
         if reason is not None and self.fired is None:
