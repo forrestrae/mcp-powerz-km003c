@@ -606,3 +606,53 @@ def test_wait_returns_after_a_manual_stop_has_disabled_the_monitor():
     release.set()
     assert rec.wait_pd(2) is True and dev.monitor == ["enable", "disable"]
     stopper.join(2)
+
+
+# --- a failed start leaves nothing behind -------------------------------------------------
+
+def test_header_failure_after_enable_closes_the_file_releases_and_disables(monkeypatch):
+    from km003c_mcp.capture import CaptureSession
+    dev = FakeDevice()
+    leases = LeaseLog(dev)
+    rec = Recorder(lambda: dev, poll_interval_s=0.001, lease=leases)
+    sessions = []
+    original = CaptureSession.__init__
+
+    def remember(self, *a, **k):
+        original(self, *a, **k)
+        sessions.append(self)
+
+    def broken_header(self, **kwargs):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(CaptureSession, "__init__", remember)
+    monkeypatch.setattr(CaptureSession, "write_header", broken_header)
+    with pytest.raises(OSError):
+        rec.start_pd()
+    assert sessions[0].writer.closed
+    assert [e[0] for e in leases.events] == ["take", "release"]
+    assert dev.monitor == ["enable", "disable"]
+    assert not rec.pd_running
+
+
+def test_lost_start_race_releases_its_lease_when_its_file_fails(monkeypatch):
+    from km003c_mcp.capture import CaptureSession
+    dev = FakeDevice()
+    leases = LeaseLog(dev)
+    rec = Recorder(lambda: dev, poll_interval_s=0.001, lease=leases)
+
+    def enable_while_another_start_wins():
+        dev.monitor.append("enable")
+        rec._pd_active = True  # the other start finished first
+        return ACCEPTED
+    dev.enable_pd_monitor = enable_while_another_start_wins
+    original_finish = CaptureSession.finish
+
+    def failing_finish(self, *a, **k):
+        original_finish(self, *a, **k)
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(CaptureSession, "finish", failing_finish)
+    with pytest.raises(Km003cError, match="already running"):
+        rec.start_pd()
+    assert [e[0] for e in leases.events] == ["take", "release"]
+    assert dev.monitor == ["enable"]  # the winner keeps the monitor
+    rec._pd_active = False

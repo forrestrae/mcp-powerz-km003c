@@ -533,6 +533,7 @@ class Recorder:
             self._pd_gen += 1
         lease = self._take_lease("pd capture")
         meter: dict = {"serial": None, "fw_version": None, "hw_version": None}
+        device = monitor = None
         try:
             device = self._provider()
             meter["serial"] = getattr(device, "serial_number", None) or None
@@ -548,31 +549,61 @@ class Recorder:
                                                           **monitor.to_dict()}, **header)
         except BaseException as exc:
             try:
-                if not session.header_written:
-                    session.write_header(meter=meter, pd_monitor=None, **header)
-                session.finish("error", (type(exc).__name__, str(exc)))
-            except (OSError, ValueError):
-                pass
-            with self._state:
-                if not self._pd_active:
-                    self._pd = session  # the failed attempt is the last capture
-            lease.release()
+                self._abandon_start(session, meter, header, exc,
+                                    device if monitor is not None else None)
+            finally:
+                lease.release()
             raise
         with self._state:
-            if self._pd_active:  # another start won the race
+            lost = self._pd_active  # another start won the race
+            if not lost:
+                self._device = device
+                self._pd = session
+                self._pd_active = True
+                self._pd_error = None
+                self._pd_monitor = monitor
+                previous, self._pd_lease = self._pd_lease, lease
+                self._ensure_thread_locked()
+        if lost:
+            # The winner needs the monitor, so it stays enabled; only this file is closed.
+            try:
                 session.finish("error", ("Km003cError", "another PD capture started first"))
+            except (OSError, ValueError) as exc:
+                log.warning("could not finish the capture file %s: %s", session.path, exc)
+            finally:
                 lease.release()
-                raise Km003cError("a PD capture is already running; stop it first")
-            self._device = device
-            self._pd = session
-            self._pd_active = True
-            self._pd_error = None
-            self._pd_monitor = monitor
-            previous, self._pd_lease = self._pd_lease, lease
-            self._ensure_thread_locked()
+            raise Km003cError("a PD capture is already running; stop it first")
         if previous is not None:
             previous.release()
         return monitor
+
+    def _abandon_start(self, session: CaptureSession, meter: dict, header: dict,
+                       exc: BaseException, enabled_on) -> None:
+        """Clean up after a start that failed: finish and close its file, and disable the PD
+        monitor when this start enabled it (``enabled_on`` is that device), unless a newer
+        start has run since."""
+        gen = self._pd_gen
+        try:
+            try:
+                if not session.header_written:
+                    session.write_header(meter=meter, pd_monitor=None, **header)
+            finally:
+                session.finish("error", (type(exc).__name__, str(exc)))
+        except (OSError, ValueError) as error:
+            log.warning("could not finish the capture file %s: %s", session.path, error)
+        with self._state:
+            if not self._pd_active:
+                self._pd = session  # the failed attempt is the last capture
+        if enabled_on is None:
+            return
+        with enabled_on.lock:
+            with self._state:
+                if self._pd_gen != gen or self._pd_active:
+                    return
+            try:
+                enabled_on.disable_pd_monitor()
+            except Exception as error:  # noqa: BLE001 - best effort; the start already failed
+                log.warning("DisablePdMonitor after a failed start failed: %s", error)
 
     def _end_pd(self, reason: str, gen: int) -> None:
         """Stop the capture from the poller when its condition or timeout is met."""
