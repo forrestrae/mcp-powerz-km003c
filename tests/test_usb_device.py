@@ -205,8 +205,167 @@ def test_open_busy_maps_to_device_busy(monkeypatch, disposed):
     stub = StubUsb("A", fail=err)
     monkeypatch.setattr(ud, "_find_devices", lambda: [stub])
     with pytest.raises(DeviceBusyError, match="POWER-Z PC software"):
-        PyUsbTransport.open()
+        PyUsbTransport.open(holder_lookup=lambda serial: None)
     assert disposed == [stub]  # the failed attempt's handle is closed
+
+
+ENODEV = usb.core.USBError("No such device (it may have been disconnected)", errno=19)
+
+
+def test_busy_error_names_the_holder(monkeypatch, disposed):
+    # macOS reports a held interface as errno 19; ioreg names the process holding it.
+    stub = StubUsb("053893", fail=ENODEV)
+    monkeypatch.setattr(ud, "_find_devices", lambda: [stub])
+    asked = []
+
+    def lookup(serial):
+        asked.append(serial)
+        return "pid 46945, python3.14"
+
+    with pytest.raises(DeviceBusyError) as info:
+        PyUsbTransport.open(holder_lookup=lookup)
+    msg = str(info.value)
+    assert asked == ["053893"]
+    assert msg.startswith("the KM003C 053893 is held by another process (pid 46945, python3.14)")
+    assert "No such device" in msg
+    assert "km003c MCP server" in msg and "POWER-Z PC software" in msg and "script" in msg
+    assert isinstance(info.value.__cause__, usb.core.USBError)
+    assert disposed == [stub]
+
+
+def test_busy_error_names_this_process_when_it_holds_the_meter(monkeypatch, disposed):
+    monkeypatch.setattr(ud, "_find_devices", lambda: [StubUsb("053893", fail=ENODEV)])
+    me = f"pid {ud.os.getpid()}, python3.14"
+    with pytest.raises(DeviceBusyError) as info:
+        PyUsbTransport.open(holder_lookup=lambda serial: me)
+    msg = str(info.value)
+    assert f"held by this same process ({me})" in msg and "was not released" in msg
+    assert "another process" not in msg
+
+
+def test_busy_error_own_pid_is_injectable():
+    err = ud.busy_error(ENODEV, "A", "pid 42, python3.14", own_pid=42)
+    assert "this same process" in str(err)
+    err = ud.busy_error(ENODEV, "A", "pid 42, python3.14", own_pid=43)
+    assert "another process (pid 42, python3.14)" in str(err)
+
+
+@pytest.mark.parametrize("failure", [
+    usb.core.USBError("Input/Output Error", errno=5),
+    usb.core.USBError("Other error"),
+    NotImplementedError("Operation not supported or unimplemented on this platform"),
+])
+def test_other_claim_errors_are_busy_without_a_holder_lookup(monkeypatch, disposed, failure):
+    stub = StubUsb("A", fail=failure)
+    monkeypatch.setattr(ud, "_find_devices", lambda: [stub])
+    looked_up = []
+    with pytest.raises(DeviceBusyError) as info:
+        PyUsbTransport.open(holder_lookup=looked_up.append)
+    msg = str(info.value)
+    assert msg.startswith(f"the USB interface of the KM003C A could not be claimed ({failure})")
+    assert "likely cause is another program holding the meter" in msg
+    assert "POWER-Z PC software" in msg and "held by another process" not in msg
+    assert looked_up == [] and disposed == [stub]
+
+
+def test_busy_error_without_a_holder(monkeypatch, disposed):
+    monkeypatch.setattr(ud, "_find_devices", lambda: [StubUsb("053893", fail=ENODEV)])
+    with pytest.raises(DeviceBusyError) as info:
+        PyUsbTransport.open(holder_lookup=lambda serial: None)
+    msg = str(info.value)
+    assert msg.startswith("the KM003C 053893 is held by another process: ")
+    assert "pid" not in msg and "Likely holders" in msg
+
+
+def test_busy_error_on_claim_interface(monkeypatch, disposed):
+    err = usb.core.USBError("Resource busy", errno=16)
+    monkeypatch.setattr(ud, "_find_devices", lambda: [StubUsb("A")])
+
+    def claim(dev, intf):
+        raise err
+    monkeypatch.setattr(usb.util, "claim_interface", claim)
+    with pytest.raises(DeviceBusyError, match="held by another process: .*Resource busy"):
+        PyUsbTransport.open(holder_lookup=lambda serial: None)
+
+
+# Trimmed from `ioreg -l -w0` on macOS with a Python process holding the meter.
+IOREG = """\
++-o Root  <class IORegistryEntry, id 0x100000100, retain 40>
+  | +-o Camera@1  <class IOUSBHostInterface, id 0x100006000, registered, matched>
+  | | {
+  | |   "idVendor" = 1452
+  | |   "idProduct" = 34064
+  | |   "bInterfaceNumber" = 0
+  | |   "UsbExclusiveOwner" = "pid 559, UVCAssistant"
+  | | }
+  | +-o POWER-Z KM003C@20110000  <class IOUSBHostDevice, id 0x100006043, registered>
+  | | {
+  | |   "idProduct" = 99
+  | |   "kUSBSerialNumberString" = "053893"
+  | |   "UsbExclusiveOwner" = "pid 46945, python3.14"
+  | |   "idVendor" = 24521
+  | |   "USB Serial Number" = "053893"
+  | | }
+  | |   +-o APP@0  <class IOUSBHostInterface, id 0x100006049, registered, matched>
+  | |   | {
+  | |   |   "idProduct" = 99
+  | |   |   "UsbExclusiveOwner" = "pid 46945, python3.14"
+  | |   |   "bInterfaceNumber" = 0
+  | |   |   "idVendor" = 24521
+  | |   |   "USB Serial Number" = "053893"
+  | |   | }
+  | |   +-o APP@1  <class IOUSBHostInterface, id 0x10000604d, registered, matched>
+  | |   | {
+  | |   |   "idProduct" = 99
+  | |   |   "UsbExclusiveOwner" = "AppleUSBACMControl"
+  | |   |   "bInterfaceNumber" = 1
+  | |   |   "idVendor" = 24521
+  | |   |   "USB Serial Number" = "053893"
+  | |   | }
+"""
+
+
+def test_parse_exclusive_owner_reads_interface_zero():
+    assert ud.parse_exclusive_owner(IOREG) == "pid 46945, python3.14"
+    assert ud.parse_exclusive_owner(IOREG, "053893") == "pid 46945, python3.14"
+
+
+def test_parse_exclusive_owner_other_serial_or_free_meter():
+    assert ud.parse_exclusive_owner(IOREG, "014270") is None
+    free = IOREG.replace('"UsbExclusiveOwner" = "pid 46945, python3.14"', '"Other" = 1')
+    assert ud.parse_exclusive_owner(free) is None
+
+
+def test_parse_exclusive_owner_falls_back_to_device_node():
+    only_device = IOREG.replace(
+        '|   |   "UsbExclusiveOwner" = "pid 46945, python3.14"', '|   |   "Other" = 1')
+    assert ud.parse_exclusive_owner(only_device) == "pid 46945, python3.14"
+
+
+def test_ioreg_lookup_skips_other_platforms_and_failures(monkeypatch):
+    monkeypatch.setattr(ud.sys, "platform", "linux")
+    assert ud.ioreg_exclusive_owner() is None
+    monkeypatch.setattr(ud.sys, "platform", "darwin")
+
+    def fail(*args, **kwargs):
+        raise FileNotFoundError("ioreg")
+    monkeypatch.setattr(ud.subprocess, "run", fail)
+    assert ud.ioreg_exclusive_owner() is None
+
+
+def test_ioreg_runs_by_absolute_path(monkeypatch):
+    monkeypatch.setattr(ud.sys, "platform", "darwin")
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args[0])
+        raise FileNotFoundError(args[0])
+    monkeypatch.setattr(ud.subprocess, "run", run)
+    monkeypatch.setattr(ud.os.path, "exists", lambda path: path == "/usr/sbin/ioreg")
+    ud.ioreg_exclusive_owner()
+    monkeypatch.setattr(ud.os.path, "exists", lambda path: False)
+    ud.ioreg_exclusive_owner()
+    assert calls == ["/usr/sbin/ioreg", "ioreg"]
 
 
 def test_open_no_device(monkeypatch):
