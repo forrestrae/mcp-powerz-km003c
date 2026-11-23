@@ -3,7 +3,7 @@ import asyncio
 import pytest
 
 import km003c_mcp.server as srv
-from fakes import FakeSerial, FakeTransport, live_adc_with_tid
+from fakes import FakeSerial, FakeTransport, live_adc_with_tid, meter_info_replies
 from km003c_mcp.server import Km003cService, build_tools
 from km003c_mcp.trigger import TriggerPort
 from km003c_mcp.usb_device import DeviceBusyError, DeviceNotFoundError, DeviceTimeoutError
@@ -100,19 +100,20 @@ def test_trigger_pd_request_builds_command():
 
 
 def test_poller_transport_error_reopens_on_next_call():
-    import time
-    # Connect (TID 3) and EnablePdMonitor (TID 4) are accepted; the first poll then times out.
-    transports = [FakeTransport(opened(bytes.fromhex("05030000"), bytes.fromhex("05040000"))),
+    # The meter info reads (TIDs 3 to 6), Connect (TID 7) and EnablePdMonitor (TID 8) are
+    # answered; the first poll then times out.
+    transports = [FakeTransport(opened(*meter_info_replies(3), bytes.fromhex("05070000"),
+                                       bytes.fromhex("05080000"))),
                   FakeTransport(opened(live_adc_with_tid(3)))]
     tools, _ = make_tools(factory=lambda: transports.pop(0))
-    assert tools.pd_capture_start() == {
-        "started": True,
-        "pd_monitor": {"accepted": True, "outcome": "accepted", "attempts": 1,
-                       "last_reply": "05040000"}}
-    deadline = time.monotonic() + 3
-    while tools.pd_capture_read()["running"] and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert tools.pd_capture_read()["error"]
+    started = tools.pd_capture_start()
+    assert started["started"] and started["path"].endswith(".jsonl")
+    assert started["pd_monitor"] == {"accepted": True, "outcome": "accepted", "attempts": 1,
+                                     "last_reply": "05080000"}
+    assert tools._service.recorder.wait_pd(3)
+    summary = tools.pd_capture_read()
+    assert summary["reason"] == "error" and summary["running"] is False
+    assert any("DeviceTimeoutError" in w for w in summary["warnings"])
     assert "vbus_v" in tools.measure()
 
 
@@ -138,7 +139,8 @@ def test_trigger_close_sends_pdm_close():
 
 
 def test_pd_capture_start_reports_reject_as_non_fatal():
-    tools, _ = make_tools(opened(bytes.fromhex("05030000"), bytes.fromhex("06040000")))
+    tools, _ = make_tools(opened(*meter_info_replies(3), bytes.fromhex("05070000"),
+                                 bytes.fromhex("06080000")))
     r = tools.pd_capture_start()
     assert r["started"] and r["pd_monitor"]["outcome"] == "already enabled or refused"
     tools._service.recorder.abort("test done")
@@ -148,12 +150,16 @@ def test_pd_capture_start_fails_when_monitor_never_enabled(monkeypatch):
     import km003c_mcp.usb_device as ud
     monkeypatch.setattr(ud, "PD_MONITOR_RETRY_DELAY_S", 0)
     replies = []
-    for tid in range(3, 13, 2):
+    for tid in range(7, 17, 2):
         replies += [bytes([0x05, tid, 0, 0]), bytes([0x03, tid + 1, 0, 0])]
-    tools, _ = make_tools(opened(*replies))
+    tools, _ = make_tools(opened(*meter_info_replies(3), *replies))
     r = tools.pd_capture_start()
     assert r["kind"] == "PdMonitorNotEnabledError"
-    assert tools.pd_capture_read()["running"] is False
+    assert tools._service.recorder.pd_running is False
+    # The file still records the attempt: header, the error, and a footer.
+    summary = tools.pd_capture_read()
+    assert summary["reason"] == "error" and summary["meter_fw"] == "2.0.0"
+    assert any("PdMonitorNotEnabledError" in w for w in summary["warnings"])
 
 
 def lagging_transport():

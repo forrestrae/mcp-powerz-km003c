@@ -1,7 +1,9 @@
 """Background poller for AdcQueue streaming and PD event capture.
 
 A single daemon thread polls the device while a stream and/or a PD capture is
-active, combining both attributes into one GetData request per cycle.
+active, combining both attributes into one GetData request per cycle. A PD capture
+writes a capture file (see :mod:`km003c_mcp.capture`) and stops itself when its stop
+condition or timeout is met.
 """
 
 from __future__ import annotations
@@ -13,12 +15,13 @@ import threading
 import time
 from collections import deque
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Callable
 
-from .pd import PdDecoder
+from .capture import CaptureSession, CaptureWriter, new_capture_path, validate_stop_options
 from .protocol import (
-    ATT_ADCQUEUE, ATT_PD, GRAPH_RATES_SPS, AdcQueueSample, PdEventStream, parse_adcqueue,
-    parse_pd, sequence_step,
+    ATT_ADCQUEUE, ATT_PD, GRAPH_RATES_SPS, AdcQueueSample, ProtocolError, parse_adcqueue,
+    sequence_step,
 )
 from .usb_device import Km003cDevice, Km003cError, PdMonitorEnable, TransportError
 
@@ -188,9 +191,15 @@ class Recorder:
         self._stream_error: str | None = None
         self._pd_active = False
         self._pd_error: str | None = None
-        self._pd_events: list[dict] = []
-        self._pd_decoder = PdDecoder()
+        # The running capture, or the last one once it stopped.
+        self._pd: CaptureSession | None = None
+        self._pd_changed = threading.Condition(self._state)
+        # True from the moment a capture stops on its own until its cleanup (DisablePdMonitor,
+        # lease release) is done; wait_pd returns only after that.
+        self._pd_ending = False
         self._pd_monitor: PdMonitorEnable | None = None
+        # (device, header "meter" block): the versions are read once per USB session.
+        self._meter_cache: tuple[object, dict] | None = None
         # Bumped by every start, before it sends anything to the meter. A failed poller's
         # cleanup compares them to skip commands that would hit a newer stream or capture.
         self._stream_gen = 0
@@ -230,12 +239,18 @@ class Recorder:
                     return
             try:
                 packets = device.get_data(mask)
+                stop_reason = None
                 with self._state:
+                    pd_gen = self._pd_gen
                     for packet in packets:
                         if packet.attribute == ATT_ADCQUEUE and self._stream:
                             self._stream.feed(parse_adcqueue(packet.payload, self._stream.rate_index))
                         elif packet.attribute == ATT_PD and self._pd_active:
-                            self._ingest_pd(packet.payload)
+                            stop_reason = self._pd.ingest(packet.payload) or stop_reason
+                    if self._pd_active:
+                        stop_reason = stop_reason or self._pd.check_timeout()
+                if stop_reason is not None:
+                    self._end_pd(stop_reason, pd_gen)
                 time.sleep(poll)
             except Exception as exc:  # noqa: BLE001 - any failure ends the capture and is reported
                 self._fail(exc)
@@ -247,13 +262,17 @@ class Recorder:
         Returns whether a stream was running.
         """
         with self._state:
-            had_stream, _, leases = self._abort_locked(reason)
+            had_stream, _, leases = self._abort_locked(reason, ("aborted", reason))
         for lease in leases:
             lease.release()
         return had_stream
 
-    def _abort_locked(self, reason: str) -> tuple[bool, bool, list]:
-        """Mark the stream and capture failed; return whether each ran and their leases."""
+    def _abort_locked(self, reason: str, error: tuple[str, str]) -> tuple[bool, bool, list]:
+        """Mark the stream and capture failed; return whether each ran and their leases.
+
+        A running capture gets an ``error`` record (``error`` is its kind and message) and a
+        footer with reason ``error``.
+        """
         had_stream = self._stream is not None
         had_pd = self._pd_active
         if self._stream:
@@ -264,14 +283,18 @@ class Recorder:
         if self._pd_active:
             self._pd_active = False
             self._pd_error = reason
+            self._close_capture_locked("error", error)
         leases = [lease for lease in (self._stream_lease, self._pd_lease) if lease is not None]
         self._stream_lease = self._pd_lease = None
         return had_stream, had_pd, leases
 
     def _fail(self, exc: Exception) -> None:
         with self._state:
-            had_stream, had_pd, leases = self._abort_locked(f"{type(exc).__name__}: {exc}")
+            had_stream, had_pd, leases = self._abort_locked(
+                f"{type(exc).__name__}: {exc}", (type(exc).__name__, str(exc)))
             stream_gen, pd_gen = self._stream_gen, self._pd_gen
+            if had_pd:
+                self._pd_ending = True
             # Stop being the poller now: a start during the cleanup below gets a new thread.
             if self._thread is threading.current_thread():
                 self._thread = None
@@ -306,6 +329,8 @@ class Recorder:
             # Only now may the owner release the meter: the cleanup above still uses it.
             for lease in leases:
                 lease.release()
+            if had_pd:
+                self._pd_cleanup_done()
 
     # --- AdcQueue stream -------------------------------------------------------------
 
@@ -374,41 +399,97 @@ class Recorder:
 
     # --- PD capture ------------------------------------------------------------------
 
-    def _ingest_pd(self, payload: bytes) -> None:
-        parsed = parse_pd(payload)
-        if not isinstance(parsed, PdEventStream):
-            return
-        for event in parsed.events:
-            self._pd_events.append({
-                "index": len(self._pd_events),
-                "timestamp_ms": event.timestamp_ms,
-                "kind": event.kind,
-                "sop": event.sop,
-                "wire_hex": event.wire.hex(),
-                "decoded": self._pd_decoder.decode(event),
-            })
+    def _close_capture_locked(self, reason: str, error: tuple[str, str] | None = None) -> None:
+        """Write the capture's footer and wake :meth:`wait_pd`; the caller holds ``_state``."""
+        try:
+            self._pd.finish(reason, error)
+        except (OSError, ValueError) as exc:
+            log.warning("could not finish the capture file %s: %s", self._pd.path, exc)
+        self._pd_changed.notify_all()
 
-    def start_pd(self) -> PdMonitorEnable:
-        """Enable the meter's PD monitor and start polling for PD events.
+    @staticmethod
+    def _meter_info(device) -> dict:
+        """Serial, firmware and hardware version for the capture header.
 
-        Raises PdMonitorNotEnabledError when the enable got neither Accept nor Reject. The
-        enable outcome stays readable through :attr:`pd_monitor` until the next start.
+        The versions come from AES memory reads, which the firmware refuses while streaming;
+        they are None then, with the reason in ``error``. A broken link still raises.
         """
+        info: dict = {"serial": getattr(device, "serial_number", None) or None,
+                      "fw_version": None, "hw_version": None}
+        read_info = getattr(device, "device_info", None)
+        if read_info is None:
+            return info
+        try:
+            details = read_info()
+        except TransportError:
+            raise
+        except (Km003cError, ProtocolError) as exc:
+            info["error"] = f"{type(exc).__name__}: {exc}"
+            return info
+        info.update(model=details.model or None, fw_version=details.fw_version or None,
+                    hw_version=details.hw_version or None)
+        return info
+
+    def start_pd(self, path: str | None = None, label: str | None = None,
+                 provenance: dict | None = None, *, stop_on: str = "none",
+                 stop_after_messages: int | None = None, settle_ms: int = 0,
+                 timeout_s: float = 60.0, status_interval_ms: int = 100) -> PdMonitorEnable:
+        """Enable the meter's PD monitor and capture PD traffic to a new capture file.
+
+        The capture stops on its own when ``stop_on`` or ``stop_after_messages`` is met (after
+        ``settle_ms`` more meter time) or ``timeout_s`` passes; :attr:`capture_path` names its
+        file. Raises PdMonitorNotEnabledError when the enable got neither Accept nor Reject;
+        the file then holds a header, an error record and a footer. The enable outcome stays
+        readable through :attr:`pd_monitor` until the next start.
+        """
+        validate_stop_options(stop_on, stop_after_messages, settle_ms, timeout_s,
+                              status_interval_ms)
+        with self._state:
+            if self._pd_active:
+                raise Km003cError("a PD capture is already running; stop it first")
+        # Create the file before touching the meter, so a bad path leaves nothing running.
+        session = CaptureSession(CaptureWriter(new_capture_path(path, label)), stop_on=stop_on,
+                                 stop_after_messages=stop_after_messages, settle_ms=settle_ms,
+                                 timeout_s=timeout_s, status_interval_ms=status_interval_ms)
+        header = {"poll_ms": self._poll * 1000, "label": label, "provenance": provenance}
         with self._state:
             self._pd_gen += 1
         lease = self._take_lease("pd capture")
+        meter: dict = {"serial": None, "fw_version": None, "hw_version": None}
         try:
             device = self._provider()
+            meter["serial"] = getattr(device, "serial_number", None) or None
+            cached = self._meter_cache
+            if cached is not None and cached[0] is device:
+                meter = cached[1]
+            else:
+                meter = self._meter_info(device)
+                if "error" not in meter:  # a refusal while streaming is retried next time
+                    self._meter_cache = (device, meter)
             monitor = device.enable_pd_monitor()
-        except BaseException:
+            session.write_header(meter=meter, pd_monitor={"enabled": monitor.accepted,
+                                                          **monitor.to_dict()}, **header)
+        except BaseException as exc:
+            try:
+                if not session.header_written:
+                    session.write_header(meter=meter, pd_monitor=None, **header)
+                session.finish("error", (type(exc).__name__, str(exc)))
+            except (OSError, ValueError):
+                pass
+            with self._state:
+                if not self._pd_active:
+                    self._pd = session  # the failed attempt is the last capture
             lease.release()
             raise
         with self._state:
+            if self._pd_active:  # another start won the race
+                session.finish("error", ("Km003cError", "another PD capture started first"))
+                lease.release()
+                raise Km003cError("a PD capture is already running; stop it first")
             self._device = device
+            self._pd = session
             self._pd_active = True
             self._pd_error = None
-            self._pd_events = []
-            self._pd_decoder = PdDecoder()
             self._pd_monitor = monitor
             previous, self._pd_lease = self._pd_lease, lease
             self._ensure_thread_locked()
@@ -416,16 +497,56 @@ class Recorder:
             previous.release()
         return monitor
 
-    def stop_pd(self) -> None:
-        """Stop polling and disable the PD monitor; it does not survive a release anyway."""
+    def _end_pd(self, reason: str, gen: int) -> None:
+        """Stop the capture from the poller when its condition or timeout is met."""
+        with self._state:
+            if not self._pd_active or self._pd_gen != gen:
+                return  # stopped or replaced meanwhile
+            self._pd_active = False
+            self._pd_ending = True
+            lease, self._pd_lease = self._pd_lease, None
+            device = self._device
+            self._close_capture_locked(reason)
+        try:
+            if device is None:
+                return
+            with device.lock:
+                with self._state:
+                    if self._pd_gen != gen:
+                        return  # a newer capture needs the monitor
+                try:
+                    device.disable_pd_monitor()
+                except TransportError:
+                    if self._on_transport_error is not None:
+                        self._on_transport_error()
+                except Km003cError as exc:
+                    log.warning("DisablePdMonitor failed: %s", exc)
+        finally:
+            if lease is not None:
+                lease.release()
+            self._pd_cleanup_done()
+
+    def _pd_cleanup_done(self) -> None:
+        with self._state:
+            self._pd_ending = False
+            self._pd_changed.notify_all()
+
+    def stop_pd(self) -> Path | None:
+        """Stop the capture (footer reason ``manual``) and disable the PD monitor.
+
+        Returns the path of the capture that was running, or None when none was.
+        """
         with self._state:
             was_active, self._pd_active = self._pd_active, False
             lease, self._pd_lease = self._pd_lease, None
             device = self._device
+            if was_active:
+                self._close_capture_locked("manual")
+            path = self._pd.path if was_active else None
         try:
             self._join_if_idle()
             if not was_active or device is None:
-                return
+                return path
             try:
                 device.disable_pd_monitor()
             except TransportError:
@@ -435,18 +556,48 @@ class Recorder:
         finally:
             if lease is not None:
                 lease.release()
+        return path
+
+    def wait_pd(self, timeout_s: float) -> bool:
+        """Block until the capture stops or ``timeout_s`` passes; True if none is running."""
+        deadline = time.monotonic() + max(timeout_s, 0)
+        with self._pd_changed:
+            while self._pd_active or self._pd_ending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._pd_changed.wait(remaining)
+            return True
+
+    def mark_pd(self, text: str) -> dict:
+        """Write a ``mark`` record into the running capture."""
+        with self._state:
+            if not self._pd_active:
+                raise Km003cError("no PD capture is running")
+            return self._pd.mark(text)
+
+    @property
+    def pd_running(self) -> bool:
+        with self._state:
+            return self._pd_active
+
+    @property
+    def capture_path(self) -> Path | None:
+        """The running capture's file, or the last one's after it stopped."""
+        with self._state:
+            return self._pd.path if self._pd is not None else None
+
+    def pd_capture_state(self) -> dict:
+        with self._state:
+            session = self._pd
+            return {"running": self._pd_active,
+                    "path": str(session.path) if session else None,
+                    "reason": session.reason if session else None,
+                    "error": self._pd_error,
+                    "messages": session.tracker.messages if session else 0}
 
     @property
     def pd_monitor(self) -> PdMonitorEnable | None:
         """Outcome of the enable sent by the most recent :meth:`start_pd`, if any."""
         with self._state:
             return self._pd_monitor
-
-    def pd_events(self, since: int = 0, limit: int = 100, decode: bool = True) -> dict:
-        with self._state:
-            selected = self._pd_events[max(since, 0):max(since, 0) + max(limit, 0)]
-            events = [e if decode else {k: v for k, v in e.items() if k != "decoded"}
-                      for e in selected]
-            return {"events": events, "next": max(since, 0) + len(selected),
-                    "total": len(self._pd_events), "running": self._pd_active,
-                    "error": self._pd_error}
