@@ -409,3 +409,34 @@ def test_paging_includes_a_mark_without_a_time(tmp_path):
     # since is a window: it keeps timed entries at or after it and drops the untimed mark.
     assert [line.split(" ")[0] for line in cr.read(path, "messages", since=1000)["lines"]] == [
         "t=1020"]
+
+
+# --- summary bound with oversized fixed fields ----------------------------------------------
+
+def _oversized(tmp_path, body):
+    deep = tmp_path
+    for k in range(4):
+        deep = deep / ("d" * 80 + str(k))
+    deep.mkdir(parents=True)
+    header = {**HEADER, "label": "L" * 10_000, "meter": {"fw_version": "F" * 10_000},
+              "pd_monitor": {"outcome": "O" * 10_000}}
+    bad = [{"type": "pd", "t_meter_ms": k, "wire": "zz"} for k in range(40)]
+    return _write(deep, [header, *bad, *body], name="c" * 100 + ".jsonl")
+
+
+@pytest.mark.parametrize("body", [[], [_pd(k, 1000 + k, CAPS) for k in range(200)]],
+                         ids=["no lines", "many lines"])
+def test_summary_bound_holds_with_oversized_fields(tmp_path, body):
+    path = _oversized(tmp_path, body)
+    extra = {"running": False, "stopped": True}
+    out = cr.read(path, "summary", extra=extra)
+    assert size(out) <= cr.SUMMARY_MAX_BYTES and out["truncated"] is bool(body)
+    assert out["stopped"] is True and out["running"] is False
+    assert out["path"].endswith(".jsonl") and out["path"].startswith("...")
+    assert "more chars" in out["label"] and "more chars" in out["meter_fw"]
+    assert len(out["warnings"]) <= cr.SUMMARY_MAX_WARNINGS
+
+
+def test_summary_with_no_lines_is_not_truncated():
+    out = cr.summary(cr.Capture(GOLDEN, HEADER, None, [], []))
+    assert out["lines"] == [] and out["truncated"] is False

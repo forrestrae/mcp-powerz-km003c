@@ -300,3 +300,16 @@ def test_wait_clamps_its_timeout(bench_factory, timeout_s):
     if timeout_s > 0:
         assert out["running"] is False and out["reason"] == "timeout"
     bench.tools.pd_capture_stop()
+
+
+def test_stop_and_wait_results_stay_within_the_summary_bound(bench_factory):
+    import json as _json
+    from km003c_mcp.capture_read import SUMMARY_MAX_BYTES
+    bench = bench_factory(S3)
+    bench.tools.pd_capture_start(label="x" * 3000, stop_after_messages=8)
+    waited = bench.tools.pd_capture_wait(timeout_s=10)
+    stopped = bench.tools.pd_capture_stop()
+    for out in (waited, stopped):
+        assert len(_json.dumps(out, separators=(",", ":"))) <= SUMMARY_MAX_BYTES
+        assert "running" in out
+    assert stopped["stopped"] is False
