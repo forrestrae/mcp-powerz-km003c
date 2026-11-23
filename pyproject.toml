@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "ruff>=0.6"]
 
 [project.scripts]
 km003c-mcp = "km003c_mcp.server:main"
@@ -31,3 +31,9 @@ packages = ["src/km003c_mcp"]
 testpaths = ["tests"]
 pythonpath = ["tests"]
 markers = ["hw: requires a real KM003C (set KM003C_HW=1)"]
+
+[tool.ruff.lint]
+# The ruff 0.17 default rule set flags 33 findings in the upstream code (import
+# order, UP035, S110, and others). Select the classic pyflakes and pycodestyle
+# error subset so `ruff check` gates real errors without rewriting upstream code.
+select = ["E4", "E7", "E9", "F"]
