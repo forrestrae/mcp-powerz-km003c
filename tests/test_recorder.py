@@ -6,7 +6,9 @@ import pytest
 
 from km003c_mcp.protocol import ATT_ADCQUEUE, ATT_PD, LogicalPacket
 from km003c_mcp.recorder import Recorder
-from km003c_mcp.usb_device import Km003cError, PdMonitorEnable, PdMonitorNotEnabledError
+from km003c_mcp.usb_device import (
+    Km003cError, PdMonitorEnable, PdMonitorNotEnabledError, TransportError,
+)
 from test_protocol import PD_STREAM
 
 
@@ -370,3 +372,108 @@ def test_poller_failure_at_its_sleep_is_reported():
     wait_until(lambda: not rec.pd_events()["running"])
     assert "OverflowError" in rec.pd_events()["error"]
     assert dev.monitor == ["enable", "disable"]
+
+
+class LeaseLog:
+    """Records lease takes and releases, and what the device had received at each release."""
+
+    def __init__(self, dev):
+        self.dev = dev
+        self.events = []
+
+    def __call__(self, holder):
+        self.events.append(("take", holder))
+        log = self
+
+        class _Lease:
+            def release(self):
+                log.events.append(("release", holder, list(log.dev.graph), list(log.dev.monitor)))
+        return _Lease()
+
+
+def test_stream_holds_a_lease_until_it_stops():
+    dev = FakeDevice()
+    leases = LeaseLog(dev)
+    rec = Recorder(lambda: dev, poll_interval_s=0.001, lease=leases)
+    rec.start_stream(3)
+    assert leases.events == [("take", "stream")]
+    rec.stop_stream()
+    # The lease ends after StopGraph went out.
+    assert leases.events[-1] == ("release", "stream", [("start", 3), ("stop",)], [])
+
+
+def test_pd_capture_holds_a_lease_until_it_stops():
+    dev = FakeDevice()
+    leases = LeaseLog(dev)
+    rec = Recorder(lambda: dev, poll_interval_s=0.001, lease=leases)
+    rec.start_pd()
+    assert leases.events == [("take", "pd capture")]
+    rec.stop_pd()
+    assert leases.events[-1] == ("release", "pd capture", [], ["enable", "disable"])
+    rec.stop_pd()
+    assert len(leases.events) == 2
+
+
+def test_failed_start_returns_its_lease():
+    dev = FakeDevice()
+    dev.enable_result = PdMonitorNotEnabledError("never accepted")
+    leases = LeaseLog(dev)
+    rec = Recorder(lambda: dev, poll_interval_s=0.001, lease=leases)
+    with pytest.raises(PdMonitorNotEnabledError):
+        rec.start_pd()
+    assert [e[0] for e in leases.events] == ["take", "release"]
+
+
+def test_poller_failure_releases_lease_after_cleanup():
+    dev = FakeDevice(error=Km003cError("bad reply"))
+    leases = LeaseLog(dev)
+    rec = Recorder(lambda: dev, poll_interval_s=0.001, lease=leases)
+    rec.start_pd()
+    wait_until(lambda: len(leases.events) == 2)
+    # The capture's lease ended only after DisablePdMonitor went out.
+    assert leases.events[1] == ("release", "pd capture", [], ["enable", "disable"])
+
+
+def test_restart_during_failure_cleanup_moves_the_lease_to_the_new_capture():
+    dev = LockingDevice()
+    leases = LeaseLog(dev)
+    rec = Recorder(lambda: dev, poll_interval_s=0.001, lease=leases)
+    rec.start_pd()
+    with dev.lock:
+        dev.fail_next = True
+        wait_until(lambda: not rec.pd_events()["running"])
+        rec.start_pd()
+    wait_until(lambda: len(leases.events) == 3)
+    # The failed capture's lease ended; the new capture holds its own.
+    assert [e[:2] for e in leases.events] == [
+        ("take", "pd capture"), ("take", "pd capture"), ("release", "pd capture")]
+    rec.stop_pd()
+    assert [e[0] for e in leases.events].count("release") == 2
+
+
+def test_stop_pd_releases_its_lease_when_the_link_fails():
+    class BrokenDisable(FakeDevice):
+        def disable_pd_monitor(self):
+            raise TransportError("USB write failed")
+
+    dev = BrokenDisable()
+    leases = LeaseLog(dev)
+    rec = Recorder(lambda: dev, poll_interval_s=0.001, lease=leases)
+    rec.start_pd()
+    with pytest.raises(TransportError):
+        rec.stop_pd()
+    assert [e[0] for e in leases.events] == ["take", "release"]
+
+
+def test_stop_stream_releases_its_lease_when_the_link_fails():
+    class BrokenStop(FakeDevice):
+        def stop_graph(self):
+            raise TransportError("USB write failed")
+
+    dev = BrokenStop()
+    leases = LeaseLog(dev)
+    rec = Recorder(lambda: dev, poll_interval_s=0.001, lease=leases)
+    rec.start_stream(3)
+    with pytest.raises(TransportError):
+        rec.stop_stream()
+    assert [e[0] for e in leases.events] == ["take", "release"]
