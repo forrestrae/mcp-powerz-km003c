@@ -560,7 +560,8 @@ def build_tools(service: Km003cService, enable_trigger: bool | None = None) -> S
         messages: the same lines, filtered and paged (limit default 50): pass a page's
         next_after as after for the next page; next_after is absent on the last page. facts: Source_Capabilities PDOs, Request RDOs with their
         object position, Accept and PS_RDY times, and Discover Identity ACKs grouped by SOP
-        and sender, each value beside its hex. full: complete decodes (limit default 20).
+        and sender, each value beside its hex; at most about 8 KB, with omitted counting what
+        a long capture left out. full: complete decodes (limit default 20).
         Filters: sop ("SOP", "SOP'", "SOP''"), types (message type or VDM command names,
         such as Request or Discover_Identity; also connect, disconnect, mark, error), since
         (keeps entries at or after that meter time in ms; marks without a time drop out),

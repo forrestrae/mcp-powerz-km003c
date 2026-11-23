@@ -156,7 +156,7 @@ decoded value sits beside the wire hex it came from.
 |---|---|
 | `summary` (default) | At most about 2 KB: one line per non-GoodCRC message, such as `t=14637562 SOP Request pos 4, 3.0 A [8210 2cb18441]`, plus connection events, marks, and errors; counts by message type; VBUS first, last, min, and max; the final contract; and warnings. When the lines do not fit, lines from the middle are dropped, `truncated` is true, and a marker line names the omitted range |
 | `messages` | The same lines, filtered and paged; `limit` defaults to 50. Pass a page's `next_after` as `after` for the next page; `next_after` is absent on the last page |
-| `facts` | What a register cross-check needs: Source_Capabilities PDOs, each Request RDO with its object position, the PDO it names, and its Accept and PS_RDY times, the final contract, and Discover Identity ACKs grouped by SOP and by sender (power and data role on SOP, cable or port on SOP'), each VDO beside its decode |
+| `facts` | What a register cross-check needs: Source_Capabilities PDOs, each Request RDO with its object position, the PDO it names, and its Accept and PS_RDY times, the final contract, and Discover Identity ACKs grouped by SOP and by sender (power and data role on SOP, cable or port on SOP'), each VDO beside its decode. At most about 8 KB: a long capture keeps the latest of each kind, always including the final contract's Source_Capabilities and Request and the latest ACK of each SOP and sender, and `omitted` counts the rest |
 | `full` | Complete decodes of the filtered messages, each with its `line`; `limit` defaults to 20, and paging works as in `messages` |
 
 Filters: `sop` (`SOP`, `SOP'`, `SOP''`), `types` (message type names, VDM command names

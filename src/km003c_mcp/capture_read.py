@@ -387,6 +387,7 @@ def negotiations(capture: Capture) -> list[dict]:
             current = {"t": e.t, "i": e.record.get("i"), "wire": e.record.get("wire"),
                        "rdo": {"hex": rdo_hex, **req}, "requested_pdo": pdo,
                        "source_capabilities_t": caps.t if caps else None,
+                       "source_capabilities_i": caps.record.get("i") if caps else None,
                        "outcome": None, "accept_t": None, "ps_rdy_t": None}
             out.append(current)
         elif current is not None and current["outcome"] is None and name in (
@@ -696,21 +697,32 @@ def _identity_vdos(vdos: list[int], identity: dict, sop: int) -> list[dict]:
     return out
 
 
-def _contract_fact(negs: list[dict]) -> dict | None:
-    final = final_contract(negs)
-    if final is None:
-        return None
-    return {"request_index": negs.index(final), **contract_brief(final)}
+FACTS_MAX_BYTES = 8192
+# How many of each kind facts keeps, tried in order until the result fits FACTS_MAX_BYTES:
+# (Source_Capabilities, Requests, Discover Identity ACKs). The final contract's
+# Source_Capabilities and Request, and the latest ACK of each SOP and sender, are kept on
+# top of these counts while the ACK cap allows.
+_FACTS_KEEP = ((4, 8, 8), (2, 4, 4), (1, 2, 2), (1, 1, 1), (1, 1, 0))
 
 
-def facts(capture: Capture) -> dict:
-    """The objects a register cross-check needs, each with its hex."""
+def _keep(items: list, n: int, must: set[int]) -> list[int]:
+    """Indexes of the last ``n`` items plus the ``must`` indexes, in order."""
+    return sorted(set(range(max(len(items) - n, 0), len(items))) | must)
+
+
+def facts(capture: Capture, max_bytes: int = FACTS_MAX_BYTES) -> dict:
+    """The objects a register cross-check needs, each with its hex, within ``max_bytes``.
+
+    A long capture keeps the latest Source_Capabilities, Requests, and Discover Identity
+    ACKs, always including the final contract's Source_Capabilities and Request; ``omitted``
+    counts what was left out.
+    """
     negs = negotiations(capture)
-    caps = []
-    identity: dict[str, dict[str, list]] = {}
+    caps: list[dict] = []
+    acks: list[tuple[str, str, dict]] = []
     for e in capture.messages:
         d = e.decoded or {}
-        if e.goodcrc:
+        if e.goodcrc or e.retry:
             continue
         if e.msg in _CAPABILITIES and e.sop == 0:
             words = _objects(e)
@@ -728,17 +740,55 @@ def facts(capture: Capture) -> dict:
                    "wire": e.record.get("wire"), "header": (e.record.get("wire") or "")[:4],
                    "vdm_header": words[0] if words else None, "vdo_count": len(vdos),
                    "vdos": _identity_vdos(vdos, vdm.get("identity") or {}, e.sop or 0)}
-            sop_name = e.record.get("sop", "SOP")
-            identity.setdefault(sop_name, {}).setdefault(sender(e), []).append(ack)
-    return {
-        "path": str(capture.path),
-        "label": capture.header.get("label"),
-        "source_capabilities": caps,
-        "requests": negs,
-        "contract": _contract_fact(negs),
-        "discover_identity_acks": identity,
-        "warnings": warnings(capture, negs),
-    }
+            acks.append((e.record.get("sop", "SOP"), sender(e), ack))
+
+    final = final_contract(negs)
+    must_req = {negs.index(final)} if final is not None else set()
+    must_caps = {k for k, c in enumerate(caps)
+                 if final is not None and c["i"] == final.get("source_capabilities_i")}
+    latest_per_group = {}
+    for k, (sop_name, who, _) in enumerate(acks):
+        latest_per_group[(sop_name, who)] = k
+    warns = warnings(capture, negs)
+    out: dict = {}
+    for keep_caps, keep_reqs, keep_acks in _FACTS_KEEP:
+        cap_idx = _keep(caps, keep_caps, must_caps)
+        req_idx = _keep(negs, keep_reqs, must_req)
+        # The latest ACK of each SOP and sender first, then the most recent others.
+        chosen = sorted(latest_per_group.values(), reverse=True)[:keep_acks]
+        for k in range(len(acks) - 1, -1, -1):
+            if len(chosen) >= keep_acks:
+                break
+            if k not in chosen:
+                chosen.append(k)
+        ack_idx = sorted(chosen)
+        identity: dict[str, dict[str, list]] = {}
+        for k in ack_idx:
+            sop_name, who, ack = acks[k]
+            identity.setdefault(sop_name, {}).setdefault(who, []).append(ack)
+        requests = [negs[k] for k in req_idx]
+        contract = None
+        if final is not None:
+            contract = {"request_index": requests.index(final), **contract_brief(final)}
+        out = {
+            "path": str(capture.path),
+            "label": _scalar(capture.header.get("label"), 80),
+            "source_capabilities": [caps[k] for k in cap_idx],
+            "requests": requests,
+            "contract": contract,
+            "discover_identity_acks": identity,
+            "omitted": {"source_capabilities": len(caps) - len(cap_idx),
+                        "requests": len(negs) - len(req_idx),
+                        "discover_identity_acks": len(acks) - len(ack_idx)},
+            "warnings": [clip(w) for w in warns[:SUMMARY_MAX_WARNINGS]],
+        }
+        out["truncated"] = any(out["omitted"].values())
+        if len(_compact(out)) <= max_bytes:
+            return out
+    out["truncated"] = True
+    out["warnings"] = out["warnings"][:1] + ["facts exceed their size bound even at the "
+                                             "smallest selection; read mode=full"]
+    return out
 
 
 def read(path: str | Path, mode: str = "summary", sop=None, types=None, since=None,
