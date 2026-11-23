@@ -141,29 +141,15 @@ def test_bare_name_is_found_in_the_capture_dir(capture_dir):
 
 # --- timestamps -----------------------------------------------------------------------------
 
-def test_reader_extends_wrapped_connection_times(tmp_path):
-    # Conn records holding only the 24-bit value, after 4.66 h of uptime: the counter
-    # wrapped between the two events, and the status of the same poll comes first.
+def test_reader_takes_connection_times_as_stored(tmp_path):
+    # 32-bit times past 2^24 ms are used as they are, not adjusted from the status block.
     path = _write(tmp_path, [
         {"type": "header", "format": "km003c-capture", "version": 1},
-        {"type": "status", "t_host": 1.0, "t_meter_ms": 0x01000005, "vbus_mv": 5000},
-        {"type": "conn", "t_meter_ms": 0xFFFFF0, "code": 0x11, "event": "connect",
-         "raw_event": "45f0ffff0011"},
-        {"type": "conn", "t_meter_ms": 0x000002, "code": 0x12, "event": "disconnect",
-         "raw_event": "450200000012"},
+        {"type": "status", "t_host": 1.0, "t_meter_ms": 40103699, "vbus_mv": 2},
+        {"type": "conn", "t_meter_ms": 40103694, "code": 0x11, "event": "connect",
+         "raw_event": "450eef630211"},
     ])
-    times = [e.t for e in cr.load_capture(path).entries if e.kind == "conn"]
-    assert times == [0x00FFFFF0, 0x01000002]
-
-
-def test_reader_extends_from_a_later_status_when_none_precedes(tmp_path):
-    path = _write(tmp_path, [
-        {"type": "header", "format": "km003c-capture", "version": 1},
-        {"type": "conn", "t_meter_ms": 0x000004, "code": 0x21, "event": "connect",
-         "raw_event": "450400000021"},
-        {"type": "status", "t_host": 1.0, "t_meter_ms": 0x02000010, "vbus_mv": 5000},
-    ])
-    assert cr.load_capture(path).entries[0].t == 0x02000004
+    assert [e.t for e in cr.load_capture(path).entries] == [40103694]
 
 
 # --- messages and full ----------------------------------------------------------------------
