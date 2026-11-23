@@ -45,6 +45,9 @@ MAX_PD_POLL_MS = 10_000
 # A reply that fails to parse loses that poll's data but leaves the link working, so the
 # poller records it and goes on; this many in a row end the stream or the capture they hit.
 MAX_CONSECUTIVE_PROTOCOL_ERRORS = 10
+# wait_pd waits at most this long per call; larger values (and inf) are clamped, because
+# Condition.wait raises OverflowError past threading.TIMEOUT_MAX.
+MAX_WAIT_S = 24 * 3600.0
 
 
 @dataclass
@@ -680,8 +683,12 @@ class Recorder:
         return path
 
     def wait_pd(self, timeout_s: float) -> bool:
-        """Block until the capture stops or ``timeout_s`` passes; True if none is running."""
-        deadline = time.monotonic() + max(timeout_s, 0)
+        """Block until the capture stops or ``timeout_s`` passes; True if none is running.
+
+        ``timeout_s`` is clamped to 0 to :data:`MAX_WAIT_S`; NaN counts as 0.
+        """
+        timeout_s = min(timeout_s, MAX_WAIT_S) if timeout_s >= 0 else 0.0
+        deadline = time.monotonic() + timeout_s
         with self._pd_changed:
             while self._pd_active or self._pd_ending:
                 remaining = deadline - time.monotonic()

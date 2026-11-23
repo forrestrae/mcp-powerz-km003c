@@ -289,3 +289,14 @@ def test_a_good_poll_resets_the_pd_error_count(bench_factory):
     time.sleep(0.05)
     assert bench.service.recorder.pd_running
     bench.tools.pd_capture_stop()
+
+
+@pytest.mark.parametrize("timeout_s", [float("inf"), 1e300, float("nan"), -5])
+def test_wait_clamps_its_timeout(bench_factory, timeout_s):
+    bench = bench_factory(S3)
+    bench.tools.pd_capture_start(timeout_s=0.2)
+    out = bench.tools.pd_capture_wait(timeout_s=timeout_s)
+    assert "error" not in out
+    if timeout_s > 0:
+        assert out["running"] is False and out["reason"] == "timeout"
+    bench.tools.pd_capture_stop()
