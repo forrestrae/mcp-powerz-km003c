@@ -161,6 +161,15 @@ def test_split_pd_legacy_and_unknown_connection_codes():
     assert (unknown.kind, unknown.code, unknown.sop) == ("connection", 0x33, None)
 
 
+def test_connection_timestamp_is_32_bit():
+    # A real poll at 40.1 million ms of uptime, past 2^24: byte 4 is the uptime's top byte.
+    payload = bytes.fromhex("13ef6302020000001d060000") + bytes.fromhex("450eef630211")
+    split = split_pd(payload)
+    (event,) = split.events
+    assert (event.kind, event.code, event.timestamp_ms) == ("connect", 0x11, 40103694)
+    assert split.status.timestamp_ms - event.timestamp_ms < 100
+
+
 def test_split_pd_keeps_records_before_a_corrupt_one():
     payload = PD_STREAM[:18] + bytes.fromhex("8b1a27000000") + bytes.fromhex("8111")
     split = split_pd(payload)
