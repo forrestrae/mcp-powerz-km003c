@@ -263,3 +263,15 @@ def test_retransmitted_request_appears_once_in_facts(tmp_path):
     assert lines[1].startswith("t=1005 SOP Request") and "(retry)" not in lines[1]
     assert lines[2].startswith("t=1006 SOP Request pos 4, 3.0 A (retry) [")
 
+
+def test_soft_reset_ends_the_negotiation_in_progress(tmp_path):
+    path = _write(tmp_path, [
+        HEADER, _pd(0, 1000, CAPS), _pd(1, 1001, "4100"),
+        _pd(2, 1005, "82102cb18441"), _pd(3, 1006, "6101"),
+        _pd(4, 1008, "ad01"), _pd(5, 1009, "4102"),  # Soft_Reset from the source
+        _pd(6, 1010, "a303"), _pd(7, 1011, "4104"),  # an Accept that answers nothing now
+        _pd(8, 1200, "a605"), _pd(9, 1201, "4106"),
+    ])
+    (req,) = cr.read(path, "facts")["requests"]
+    assert req["outcome"] is None and req["ps_rdy_t"] is None
+    assert cr.read(path)["contract"] is None

@@ -263,7 +263,9 @@ def negotiations(capture: Capture) -> list[dict]:
         if e.sop != 0 or e.goodcrc or e.retry:
             continue
         name = e.msg
-        if name in _CAPABILITIES:
+        if name == "Soft_Reset":
+            current = None  # as in StopTracker: the negotiation starts over
+        elif name in _CAPABILITIES:
             caps = e
         elif name in _REQUESTS and "request" in (e.decoded or {}):
             rdo_hex = _objects(e)[0] if _objects(e) else None
