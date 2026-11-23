@@ -6,6 +6,7 @@ import logging
 import os
 import threading
 import time
+from dataclasses import asdict, dataclass
 from typing import Callable, Protocol
 
 import usb.core
@@ -13,10 +14,10 @@ import usb.util
 
 from . import crypto
 from .protocol import (
-    ATT_ADC, ATT_PD, CMD_ACCEPT, CMD_CONNECT, CMD_DISCONNECT, CMD_GET_DATA, CMD_MEMORY_READ,
-    CMD_NOT_READABLE, CMD_PUT_DATA, CMD_REJECT, CMD_START_GRAPH, CMD_STOP_GRAPH,
-    CMD_STREAMING_AUTH, AdcReading, LogicalPacket, PdEventStream, PdStatus, ProtocolError,
-    encode_ctrl, parse_adc, parse_pd, parse_putdata,
+    ATT_ADC, ATT_PD, CMD_ACCEPT, CMD_CONNECT, CMD_DISABLE_PD_MONITOR, CMD_DISCONNECT,
+    CMD_ENABLE_PD_MONITOR, CMD_GET_DATA, CMD_MEMORY_READ, CMD_NOT_READABLE, CMD_PUT_DATA,
+    CMD_REJECT, CMD_START_GRAPH, CMD_STOP_GRAPH, CMD_STREAMING_AUTH, AdcReading, LogicalPacket,
+    PdEventStream, PdStatus, ProtocolError, encode_ctrl, parse_adc, parse_pd, parse_putdata,
 )
 
 log = logging.getLogger(__name__)
@@ -29,6 +30,11 @@ EP_IN = 0x81
 TIMEOUT_MS = 2000
 READ_SIZE = 8192
 CONNECT_ATTEMPTS = 3
+PD_MONITOR_ATTEMPTS = 5
+PD_MONITOR_RETRY_DELAY_S = 0.2
+# Reply timeout for the Connect and EnablePdMonitor of each enable attempt. Bounds how long
+# one attempt holds the device lock, so a running stream's poller is not starved.
+PD_MONITOR_TIMEOUT_MS = 500
 
 
 class Km003cError(Exception):
@@ -53,6 +59,29 @@ class DeviceTimeoutError(TransportError):
 
 class CommandRejectedError(Km003cError):
     pass
+
+
+class PdMonitorNotEnabledError(Km003cError):
+    """EnablePdMonitor got neither Accept nor Reject on any attempt."""
+
+
+@dataclass(frozen=True)
+class PdMonitorEnable:
+    """Outcome of :meth:`Km003cDevice.enable_pd_monitor`.
+
+    ``accepted`` is False when the meter answered Reject. Firmware 2.0.0 does so when the
+    monitor is already enabled and no Connect came between; other firmware may also refuse.
+    Capture still works then.
+    ``last_reply`` is the hex header of the last reply, or None if the last attempt timed out.
+    """
+
+    accepted: bool
+    outcome: str
+    attempts: int
+    last_reply: str | None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 class UsbTransport(Protocol):
@@ -184,10 +213,11 @@ class Km003cDevice:
         self._tid = self._tid % 255 + 1
         return self._tid
 
-    def _transact(self, packet: bytes, match: Callable[[bytes], bool]) -> bytes:
+    def _transact(self, packet: bytes, match: Callable[[bytes], bool],
+                  timeout_ms: int = TIMEOUT_MS) -> bytes:
         """Send a packet and return the first reply accepted by ``match``; drop the rest."""
-        self.transport.write(packet, TIMEOUT_MS)
-        deadline = time.monotonic() + TIMEOUT_MS / 1000
+        self.transport.write(packet, timeout_ms)
+        deadline = time.monotonic() + timeout_ms / 1000
         while True:
             remaining = int((deadline - time.monotonic()) * 1000)
             if remaining <= 0:
@@ -197,10 +227,11 @@ class Km003cDevice:
                 return reply
             log.debug("dropping unmatched packet %s", reply[:8].hex())
 
-    def _control(self, cmd: int, attribute: int = 0) -> bytes:
+    def _control(self, cmd: int, attribute: int = 0, timeout_ms: int = TIMEOUT_MS) -> bytes:
         """Send a control command and return its same-TID reply."""
         tid = self._next_tid()
-        return self._transact(encode_ctrl(cmd, tid, attribute), lambda r: r[1] == tid)
+        return self._transact(encode_ctrl(cmd, tid, attribute), lambda r: r[1] == tid,
+                              timeout_ms)
 
     def connect(self) -> None:
         with self.lock:
@@ -227,6 +258,55 @@ class Km003cDevice:
                                lambda r: r[1] == tid or _cmd(r) == CMD_DISCONNECT)
             except DeviceTimeoutError:
                 pass
+
+    def enable_pd_monitor(self) -> PdMonitorEnable:
+        """Connect, then send EnablePdMonitor; retry with Connect and a short pause between.
+
+        Accept and Reject both end the retries. Firmware 2.0.0 captures PD traffic without the
+        enable and answers a repeated enable with Reject, so Reject is reported, not raised.
+
+        Each attempt sends one Connect and one EnablePdMonitor, each waiting at most
+        ``PD_MONITOR_TIMEOUT_MS`` for its reply, and holds the device lock only for that
+        attempt. A running stream's poller therefore waits at most about 1 s for the lock,
+        and the whole call takes at most about 6 s when the meter never answers.
+        """
+        last_reply: str | None = None
+        last_error: Exception | None = None
+        for attempt in range(1, PD_MONITOR_ATTEMPTS + 1):
+            if attempt > 1:
+                time.sleep(PD_MONITOR_RETRY_DELAY_S)
+            with self.lock:
+                try:
+                    reply = self._control(CMD_CONNECT, timeout_ms=PD_MONITOR_TIMEOUT_MS)
+                    if _cmd(reply) != CMD_ACCEPT:
+                        last_reply = None
+                        last_error = CommandRejectedError(
+                            f"Connect answered with 0x{_cmd(reply):02x}")
+                        continue
+                    reply = self._control(CMD_ENABLE_PD_MONITOR, 1,
+                                          timeout_ms=PD_MONITOR_TIMEOUT_MS)
+                except DeviceTimeoutError as exc:
+                    last_reply, last_error = None, exc
+                    continue
+            last_reply = reply[:4].hex()
+            if _cmd(reply) == CMD_ACCEPT:
+                return PdMonitorEnable(True, "accepted", attempt, last_reply)
+            if _cmd(reply) == CMD_REJECT:
+                log.info("EnablePdMonitor answered Reject: already enabled or refused")
+                return PdMonitorEnable(False, "already enabled or refused", attempt, last_reply)
+            last_error = CommandRejectedError(
+                f"EnablePdMonitor answered with 0x{_cmd(reply):02x}")
+        raise PdMonitorNotEnabledError(
+            f"PD monitor not enabled after {PD_MONITOR_ATTEMPTS} attempts "
+            f"(last reply {last_reply or 'none'}): {last_error}")
+
+    def disable_pd_monitor(self) -> bool:
+        """Send DisablePdMonitor. Returns True on Accept, False on Reject (already off)."""
+        with self.lock:
+            reply = self._control(CMD_DISABLE_PD_MONITOR, 0)
+            if _cmd(reply) not in (CMD_ACCEPT, CMD_REJECT):
+                raise CommandRejectedError(f"DisablePdMonitor answered with 0x{_cmd(reply):02x}")
+            return _cmd(reply) == CMD_ACCEPT
 
     def get_data(self, attribute_mask: int) -> list[LogicalPacket]:
         with self.lock:

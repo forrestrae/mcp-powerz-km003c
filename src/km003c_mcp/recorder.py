@@ -7,6 +7,7 @@ active, combining both attributes into one GetData request per cycle.
 from __future__ import annotations
 
 import csv
+import logging
 import threading
 import time
 from collections import deque
@@ -18,7 +19,9 @@ from .protocol import (
     ATT_ADCQUEUE, ATT_PD, GRAPH_RATES_SPS, AdcQueueSample, PdEventStream, parse_adcqueue,
     parse_pd, sequence_step,
 )
-from .usb_device import Km003cDevice, Km003cError, TransportError
+from .usb_device import Km003cDevice, Km003cError, PdMonitorEnable, TransportError
+
+log = logging.getLogger(__name__)
 
 CSV_HEADER = ["sequence", "marker", "vbus_v", "ibus_a", "power_w", "cc1_v", "cc2_v", "dp_v", "dm_v"]
 RECENT_SAMPLES = 20
@@ -140,11 +143,21 @@ class Recorder:
         self._pd_error: str | None = None
         self._pd_events: list[dict] = []
         self._pd_decoder = PdDecoder()
+        self._pd_monitor: PdMonitorEnable | None = None
+        # Bumped by every start, before it sends anything to the meter. A failed poller's
+        # cleanup compares them to skip commands that would hit a newer stream or capture.
+        self._stream_gen = 0
+        self._pd_gen = 0
 
     # --- lifecycle -------------------------------------------------------------------
 
-    def _ensure_thread(self) -> None:
-        if self._thread is None or not self._thread.is_alive():
+    def _ensure_thread_locked(self) -> None:
+        """Start the poller unless one is running; the caller holds ``_state``.
+
+        The poller clears ``_thread`` under the same lock when it exits, so a start can
+        never see a dying thread as running and leave its work unpolled.
+        """
+        if self._thread is None:
             self._thread = threading.Thread(target=self._run, name="km003c-poller", daemon=True)
             self._thread.start()
 
@@ -154,15 +167,19 @@ class Recorder:
             thread.join(timeout=2)
 
     def _run(self) -> None:
+        me = threading.current_thread()
         while True:
             with self._state:
+                if self._thread is not me:
+                    return  # a failure handed polling to a newer thread
                 mask = (ATT_ADCQUEUE if self._stream else 0) | (ATT_PD if self._pd_active else 0)
                 device = self._device
                 poll = self._poll
                 if self._stream and self._stream.rate_index == 3:
                     poll = min(poll, FAST_POLL_INTERVAL_S)
-            if not mask or device is None:
-                return
+                if not mask or device is None:
+                    self._thread = None
+                    return
             try:
                 packets = device.get_data(mask)
                 with self._state:
@@ -171,10 +188,10 @@ class Recorder:
                             self._stream.feed(parse_adcqueue(packet.payload, self._stream.rate_index))
                         elif packet.attribute == ATT_PD and self._pd_active:
                             self._ingest_pd(packet.payload)
+                time.sleep(poll)
             except Exception as exc:  # noqa: BLE001 - any failure ends the capture and is reported
                 self._fail(exc)
                 return
-            time.sleep(poll)
 
     def abort(self, reason: str) -> bool:
         """Mark any running stream/capture as failed without touching the device.
@@ -182,30 +199,54 @@ class Recorder:
         Returns whether a stream was running.
         """
         with self._state:
-            had_stream = self._stream is not None
-            if self._stream:
-                self._stream.close()
-                self._last_stats = self._stream.stats
-                self._stream = None
-                self._stream_error = reason
-            if self._pd_active:
-                self._pd_active = False
-                self._pd_error = reason
-            return had_stream
+            return self._abort_locked(reason)[0]
+
+    def _abort_locked(self, reason: str) -> tuple[bool, bool]:
+        """Mark the stream and capture failed; return whether each was running."""
+        had_stream = self._stream is not None
+        had_pd = self._pd_active
+        if self._stream:
+            self._stream.close()
+            self._last_stats = self._stream.stats
+            self._stream = None
+            self._stream_error = reason
+        if self._pd_active:
+            self._pd_active = False
+            self._pd_error = reason
+        return had_stream, had_pd
 
     def _fail(self, exc: Exception) -> None:
-        had_stream = self.abort(f"{type(exc).__name__}: {exc}")
+        with self._state:
+            had_stream, had_pd = self._abort_locked(f"{type(exc).__name__}: {exc}")
+            stream_gen, pd_gen = self._stream_gen, self._pd_gen
+            # Stop being the poller now: a start during the cleanup below gets a new thread.
+            if self._thread is threading.current_thread():
+                self._thread = None
         device = self._device
         if isinstance(exc, TransportError):
             # The USB session is gone; let the owner drop it so the next call reopens.
             if self._on_transport_error is not None:
                 self._on_transport_error()
-        elif had_stream and device is not None:
-            # The link still works, so stop the firmware stream instead of leaving it running.
-            try:
-                device.stop_graph()
-            except Exception:  # noqa: BLE001 - best effort
-                device.graph_rate = None
+            return
+        if device is None:
+            return
+        # The link still works, so stop the firmware stream and PD monitor instead of leaving
+        # them running. Holding the device lock orders these commands against a new start:
+        # one that began before the check below is skipped, a later one runs after them.
+        with device.lock:
+            with self._state:
+                stream_current = self._stream_gen == stream_gen
+                pd_current = self._pd_gen == pd_gen
+            if had_stream and stream_current:
+                try:
+                    device.stop_graph()
+                except Exception:  # noqa: BLE001 - best effort
+                    device.graph_rate = None
+            if had_pd and pd_current:
+                try:
+                    device.disable_pd_monitor()
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
 
     # --- AdcQueue stream -------------------------------------------------------------
 
@@ -217,6 +258,8 @@ class Recorder:
                 raise Km003cError("a stream is already running; stop it first")
         # Open the CSV before starting the firmware stream so a bad path leaves nothing running.
         stream = _Stream(rate_index, csv_path, self._keep)
+        with self._state:
+            self._stream_gen += 1
         try:
             device = self._provider()
             device.start_graph(rate_index)
@@ -227,7 +270,7 @@ class Recorder:
             self._device = device
             self._stream = stream
             self._stream_error = None
-        self._ensure_thread()
+            self._ensure_thread_locked()
 
     def stop_stream(self) -> StreamStats:
         with self._state:
@@ -276,20 +319,46 @@ class Recorder:
                 "decoded": self._pd_decoder.decode(event),
             })
 
-    def start_pd(self) -> None:
+    def start_pd(self) -> PdMonitorEnable:
+        """Enable the meter's PD monitor and start polling for PD events.
+
+        Raises PdMonitorNotEnabledError when the enable got neither Accept nor Reject. The
+        enable outcome stays readable through :attr:`pd_monitor` until the next start.
+        """
+        with self._state:
+            self._pd_gen += 1
         device = self._provider()
+        monitor = device.enable_pd_monitor()
         with self._state:
             self._device = device
             self._pd_active = True
             self._pd_error = None
             self._pd_events = []
             self._pd_decoder = PdDecoder()
-        self._ensure_thread()
+            self._pd_monitor = monitor
+            self._ensure_thread_locked()
+        return monitor
 
     def stop_pd(self) -> None:
+        """Stop polling and disable the PD monitor; it does not survive a release anyway."""
         with self._state:
-            self._pd_active = False
+            was_active, self._pd_active = self._pd_active, False
+            device = self._device
         self._join_if_idle()
+        if not was_active or device is None:
+            return
+        try:
+            device.disable_pd_monitor()
+        except TransportError:
+            raise
+        except Km003cError as exc:
+            log.warning("DisablePdMonitor failed: %s", exc)
+
+    @property
+    def pd_monitor(self) -> PdMonitorEnable | None:
+        """Outcome of the enable sent by the most recent :meth:`start_pd`, if any."""
+        with self._state:
+            return self._pd_monitor
 
     def pd_events(self, since: int = 0, limit: int = 100, decode: bool = True) -> dict:
         with self._state:

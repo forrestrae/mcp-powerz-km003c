@@ -12,10 +12,15 @@ pytestmark = [pytest.mark.hw,
 
 
 @pytest.fixture(scope="module")
-def tools():
+def service():
     service = Km003cService()
-    yield build_tools(service)
+    yield service
     service.shutdown()
+
+
+@pytest.fixture(scope="module")
+def tools(service):
+    return build_tools(service)
 
 
 def test_hw_device_info(tools):
@@ -36,10 +41,38 @@ def test_hw_stream_1000sps(tools):
 
 
 def test_hw_pd_capture_idle(tools):
-    assert tools.pd_capture_start() == {"started": True}
+    assert tools.pd_capture_start()["started"]
     time.sleep(0.5)
     page = tools.pd_capture_read()
     assert page["error"] is None
+    assert tools.pd_capture_stop()["stopped"]
+
+
+def test_hw_pd_capture_during_1000sps_stream(tools):
+    # pd_capture_start sends Connect and EnablePdMonitor while the stream's poller runs.
+    assert tools.stream_start(rate_sps=1000)["started"]
+    time.sleep(0.3)
+    assert tools.pd_capture_start()["started"]
+    time.sleep(2)
+    status = tools.stream_status()
+    assert status["running"] and status["error"] is None
+    assert tools.pd_capture_read()["error"] is None
+    assert tools.pd_capture_stop()["stopped"]
+    st = tools.stream_stop()
+    print(f"stream with capture: {st['samples']} samples, {st['dropped_samples']} dropped")
+    assert st["samples"] >= 2000 and st["dropped_samples"] <= st["samples"] * 0.01
+
+
+def test_hw_pd_monitor_enable(service, tools):
+    # Firmware 2.0.0 answers Reject to a repeated enable with no Connect between them.
+    # enable_pd_monitor() sends Connect first, which that firmware answers with Accept again.
+    first = tools.pd_capture_start()["pd_monitor"]
+    assert first["outcome"] in ("accepted", "already enabled or refused")
+    again = service.device().enable_pd_monitor()
+    assert again.outcome in ("accepted", "already enabled or refused")
+    assert tools.pd_capture_stop()["stopped"]
+    # stop disabled the monitor, so the next enable is accepted.
+    assert tools.pd_capture_start()["pd_monitor"]["accepted"]
     assert tools.pd_capture_stop()["stopped"]
 
 
