@@ -236,3 +236,30 @@ def test_identity_vdos_of_a_dual_role_partner():
     out = cr._identity_vdos(vdos, decode_identity(vdos, 0), 0)
     assert [v["name"] for v in out] == ["id_header", "cert_stat", "product", "ufp", "pad", "dfp"]
     assert out[5]["hex"] == "22000000" and out[5]["decoded"] is not None
+
+
+# --- retransmissions and Soft_Reset ---------------------------------------------------------
+
+def _pd(i, t, wire, sop="SOP"):
+    code = {"SOP": 0, "SOP'": 1}[sop]
+    head = bytes([0x80 | (len(wire) // 2 + 5)]) + t.to_bytes(4, "little") + bytes([code])
+    return {"type": "pd", "i": i, "t_meter_ms": t, "sop": sop, "wire": wire,
+            "raw_event": head.hex() + wire}
+
+
+HEADER = {"type": "header", "format": "km003c-capture", "version": 1}
+CAPS = "a1412c9181092cd102002cb10400d6410600"
+
+
+def test_retransmitted_request_appears_once_in_facts(tmp_path):
+    path = _write(tmp_path, [
+        HEADER, _pd(0, 1000, CAPS), _pd(1, 1001, "4100"),
+        _pd(2, 1005, "82102cb18441"), _pd(3, 1006, "82102cb18441"), _pd(4, 1007, "6101"),
+        _pd(5, 1009, "a303"), _pd(6, 1010, "4102"), _pd(7, 1200, "a605"), _pd(8, 1201, "4104"),
+    ])
+    f = cr.read(path, "facts")
+    assert len(f["requests"]) == 1 and f["requests"][0]["ps_rdy_t"] == 1200
+    lines = cr.read(path)["lines"]
+    assert lines[1].startswith("t=1005 SOP Request") and "(retry)" not in lines[1]
+    assert lines[2].startswith("t=1006 SOP Request pos 4, 3.0 A (retry) [")
+
