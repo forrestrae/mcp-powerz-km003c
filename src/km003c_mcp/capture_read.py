@@ -9,7 +9,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .capture import FORMAT, VERSION, capture_dir, extend_timestamp24
+from .capture import FORMAT, VERSION, RetryFilter, capture_dir, extend_timestamp24
 from .pd import SOP_NAMES, PdDecoder
 from .pd_objects import bits
 from .protocol import PdEvent
@@ -34,6 +34,7 @@ class Entry:
     record: dict
     decoded: dict | None = None
     sop: int | None = None
+    retry: bool = False  # a retransmission of the sender's previous message
 
     @property
     def msg(self) -> str | None:
@@ -114,6 +115,7 @@ def load_capture(path: str | Path) -> Capture:
 
     entries: list[Entry] = []
     decoder = PdDecoder()
+    retries = RetryFilter()
     last_status: dict | None = None
     for k, r in enumerate(body):
         kind = r.get("type")
@@ -123,7 +125,10 @@ def load_capture(path: str | Path) -> Capture:
         ref = last_status or following[k]
         ref_t = ref.get("t_meter_ms") if ref else None
         if kind == "pd":
-            entries.append(_decode_entry(r, decoder))
+            entry = _decode_entry(r, decoder)
+            wire = bytes.fromhex(r.get("wire") or "") if _is_hex(r.get("wire")) else b""
+            entry.retry = retries.is_retry(entry.sop, wire, entry.goodcrc)
+            entries.append(entry)
         elif kind == "conn":
             entries.append(Entry("conn", extend_timestamp24(r.get("t_meter_ms", 0), ref_t), r))
         elif kind in ("mark", "error"):
@@ -132,6 +137,14 @@ def load_capture(path: str | Path) -> Capture:
                 t = round(ref_t + (r["t_host"] - ref["t_host"]) * 1000)
             entries.append(Entry(kind, t, r))
     return Capture(p, header, footer, entries, status, problems)
+
+
+def _is_hex(value) -> bool:
+    try:
+        bytes.fromhex(value)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _decode_entry(r: dict, decoder: PdDecoder) -> Entry:
@@ -219,7 +232,8 @@ def message_text(entry: Entry) -> str:
 def entry_line(entry: Entry) -> str:
     r = entry.record
     if entry.kind == "pd":
-        return (f"t={entry.t} {r.get('sop', 'SOP')} {message_text(entry)} "
+        retry = " (retry)" if entry.retry else ""
+        return (f"t={entry.t} {r.get('sop', 'SOP')} {message_text(entry)}{retry} "
                 f"[{wire_groups(r.get('wire', ''))}]")
     t = "?" if entry.t is None else entry.t
     if entry.kind == "conn":
@@ -238,12 +252,15 @@ def _objects(entry: Entry) -> list[str]:
 
 
 def negotiations(capture: Capture) -> list[dict]:
-    """Every Request on SOP with the PDO it names, its reply and the PS_RDY that ended it."""
+    """Every Request on SOP with the PDO it names, its reply and the PS_RDY that ended it.
+
+    Retransmissions count once. A Soft_Reset ends the negotiation in progress.
+    """
     out: list[dict] = []
     caps: Entry | None = None
     current: dict | None = None
     for e in capture.messages:
-        if e.sop != 0 or e.goodcrc:
+        if e.sop != 0 or e.goodcrc or e.retry:
             continue
         name = e.msg
         if name in _CAPABILITIES:
