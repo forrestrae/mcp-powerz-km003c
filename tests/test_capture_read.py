@@ -308,3 +308,50 @@ def test_long_mark_error_and_wire_are_cut_with_an_indication(tmp_path):
     assert "more chars)]" in lines[2]
     (msg,) = cr.read(path, "full")["messages"]
     assert len(msg["wire"]) < 200 and msg["wire"].endswith("more chars)")
+
+
+# --- malformed records ----------------------------------------------------------------------
+
+STATUS = {"type": "status", "t_host": 1.0, "t_meter_ms": 1000, "vbus_mv": 5000}
+
+
+@pytest.mark.parametrize("bad, problem", [
+    ({**HEADER, "meter": "KM003C"}, "header meter is not an object"),
+    ({**HEADER, "pd_monitor": "accepted"}, "header pd_monitor is not an object"),
+    ({**HEADER, "stop": "contract"}, "header stop is not an object"),
+    ({"type": "conn", "t_meter_ms": "1000", "code": 17, "event": "connect",
+      "raw_event": "45"}, "conn record has a bad t_meter_ms"),
+    ({"type": "mark", "t_host": "now", "text": "x"}, "mark record has a bad t_host"),
+    ({"type": "error", "t_host": 1.0, "kind": 5, "message": "x"}, "error record has a bad kind"),
+    ({"type": "pd", "i": 0, "t_meter_ms": 1001, "sop": "SOP", "wire": "a303",
+      "raw_event": 12}, "pd record has a bad raw_event"),
+    ({"type": "pd", "i": 0, "t_meter_ms": 1001, "sop": "SOP", "wire": "a303",
+      "raw_event": "zz"}, "pd record has a bad raw_event"),
+    ({"type": "pd", "i": 0, "t_meter_ms": 1001, "sop": "SOP", "wire": None},
+     "pd record has a bad wire"),
+    ({"type": "status", "t_host": 1.0, "t_meter_ms": 2.5, "vbus_mv": 5000},
+     "status record has a bad t_meter_ms"),
+    ({"type": "footer", "reason": "manual", "vbus_mv": "flat"}, "footer vbus_mv is malformed"),
+    ({"type": "footer", "reason": "manual", "vbus_mv": {"first": "0"}},
+     "footer vbus_mv is malformed"),
+    ({"type": "footer", "reason": ["manual"]}, "footer record has a bad reason"),
+    ({"type": 7}, "unknown record type"),
+])
+def test_malformed_records_are_flagged_not_raised(tmp_path, capsys, bad, problem):
+    lines = [bad, STATUS] if bad.get("type") == "header" else [HEADER, STATUS, bad]
+    path = _write(tmp_path, lines + [_pd(1, 1002, "a605")])
+    from km003c_mcp.cli import main
+    for mode in cr.MODES:
+        out = cr.read(path, mode)
+        assert "path" in out
+    assert any(problem in w for w in cr.read(path)["warnings"])
+    assert cr.read(path)["lines"][-1].startswith("t=1002 SOP PS_RDY")
+    assert main(["summarize", str(path)]) == 0 and main(["facts", str(path)]) == 0
+
+
+def test_cli_exits_2_for_an_unreadable_file(tmp_path, capsys):
+    from km003c_mcp.cli import main
+    (tmp_path / "x.jsonl").write_text('"just a string"\n')
+    assert main(["summarize", str(tmp_path / "x.jsonl")]) == 2
+    assert main(["facts", str(tmp_path)]) == 2
+    assert "cannot read" in capsys.readouterr().err

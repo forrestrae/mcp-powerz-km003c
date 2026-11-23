@@ -104,15 +104,24 @@ def load_capture(path: str | Path) -> Capture:
             problems.append(f"line {n} is incomplete (the capture was cut off while writing)"
                             if n == len(lines) else f"line {n} is not a JSON object; skipped")
             continue
-        records.append(record)
-    if not records or records[0].get("type") != "header" or records[0].get("format") != FORMAT:
+        records.append((n, record))
+    first = records[0][1] if records else {}
+    if first.get("type") != "header" or first.get("format") != FORMAT:
         raise ValueError(f"{p} is not a {FORMAT} file (no header record)")
-    if records[0].get("version") != VERSION:
-        raise ValueError(f"{p} is {FORMAT} version {records[0].get('version')}; "
+    if first.get("version") != VERSION:
+        raise ValueError(f"{p} is {FORMAT} version {first.get('version')!r}; "
                          f"this reader understands version {VERSION}")
-    header = records[0]
-    footer = next((r for r in records if r.get("type") == "footer"), None)
-    body = [r for r in records[1:] if r.get("type") != "footer"]
+    header = _clean_header(first, problems)
+    footer = None
+    body = []
+    for n, r in records[1:]:
+        problem = _check_record(r)
+        if problem is not None:
+            problems.append(f"line {n}: {problem}; skipped")
+        elif r["type"] == "footer":
+            footer = footer or _clean_footer(r, problems)
+        else:
+            body.append(r)
 
     # Status blocks carry the 32-bit uptime; the nearest one at or before a record (else the
     # next one) is the reference for extending its 24-bit time and for placing marks.
@@ -135,6 +144,7 @@ def load_capture(path: str | Path) -> Capture:
             continue
         ref = last_status or following[k]
         ref_t = ref.get("t_meter_ms") if ref else None
+        ref_host = ref.get("t_host") if ref else None
         if kind == "pd":
             entry = _decode_entry(r, decoder)
             wire = bytes.fromhex(r.get("wire") or "") if _is_hex(r.get("wire")) else b""
@@ -144,10 +154,84 @@ def load_capture(path: str | Path) -> Capture:
             entries.append(Entry("conn", extend_timestamp24(r.get("t_meter_ms", 0), ref_t), r))
         elif kind in ("mark", "error"):
             t = None
-            if ref is not None and "t_host" in r and "t_host" in ref:
-                t = round(ref_t + (r["t_host"] - ref["t_host"]) * 1000)
+            if ref_t is not None and _is_number(r.get("t_host")) and _is_number(ref_host):
+                try:
+                    t = round(ref_t + (r["t_host"] - ref_host) * 1000)
+                except (OverflowError, ValueError):  # inf or NaN host times
+                    t = None
             entries.append(Entry(kind, t, r))
     return Capture(p, header, footer, entries, status, problems)
+
+
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_text(value) -> bool:
+    return isinstance(value, str)
+
+
+def _optional(check):
+    return lambda value: value is None or check(value)
+
+
+# The fields each body record needs, with their checks; a record that fails is skipped.
+_RECORD_FIELDS = {
+    "status": {"t_meter_ms": _is_int, "vbus_mv": _is_int, "t_host": _optional(_is_number)},
+    "pd": {"t_meter_ms": _is_int, "wire": lambda v: _is_text(v) and _is_hex(v),
+           "raw_event": _optional(lambda v: _is_text(v) and _is_hex(v)),
+           "sop": _optional(_is_text), "i": _optional(_is_int)},
+    "conn": {"t_meter_ms": _is_int, "code": _optional(_is_int), "event": _optional(_is_text),
+             "raw_event": _optional(_is_text)},
+    "mark": {"t_host": _optional(_is_number), "text": _optional(_is_text)},
+    "error": {"t_host": _optional(_is_number), "kind": _optional(_is_text),
+              "message": _optional(_is_text)},
+    "footer": {"reason": _optional(_is_text)},
+}
+
+
+def _check_record(r: dict) -> str | None:
+    """Why a body record cannot be used, or None."""
+    kind = r.get("type")
+    fields = _RECORD_FIELDS.get(kind) if isinstance(kind, str) else None
+    if fields is None:
+        return f"unknown record type {clip(repr(kind), 40)}"
+    for name, check in fields.items():
+        if not check(r.get(name)):
+            return f"{kind} record has a bad {name} ({clip(repr(r.get(name)), 40)})"
+    return None
+
+
+def _clean_header(header: dict, problems: list[str]) -> dict:
+    """The header with every nested block a dict (or None) and the label text (or None)."""
+    out = dict(header)
+    for name in ("meter", "server", "pd_monitor", "stop"):
+        if out.get(name) is not None and not isinstance(out[name], dict):
+            problems.append(f"line 1: header {name} is not an object; ignored")
+            out[name] = None
+    if out.get("label") is not None and not isinstance(out["label"], str):
+        out["label"] = str(out["label"])
+    return out
+
+
+def _clean_footer(footer: dict, problems: list[str]) -> dict:
+    """The footer with malformed counts or VBUS statistics dropped."""
+    out = dict(footer)
+    counts = out.get("counts")
+    if counts is not None and not (isinstance(counts, dict)
+                                   and all(_is_int(v) for v in counts.values())):
+        problems.append("footer counts are malformed; ignored")
+        out.pop("counts")
+    vbus = out.get("vbus_mv")
+    if vbus is not None and not (isinstance(vbus, dict) and all(
+            _optional(_is_int)(vbus.get(k)) for k in ("first", "last", "min", "max"))):
+        problems.append("footer vbus_mv is malformed; ignored")
+        out.pop("vbus_mv")
+    return out
 
 
 def _is_hex(value) -> bool:
@@ -159,7 +243,7 @@ def _is_hex(value) -> bool:
 
 
 def _decode_entry(r: dict, decoder: PdDecoder) -> Entry:
-    raw = bytes.fromhex(r.get("raw_event") or "")
+    raw = bytes.fromhex(r.get("raw_event") or "")  # checked by _check_record
     sop = raw[5] if len(raw) >= 6 else _SOP_CODES.get(str(r.get("sop", "SOP")).lower(), 0)
     try:
         wire = bytes.fromhex(r.get("wire") or "")
@@ -376,6 +460,8 @@ def warnings(capture: Capture, negs: list[dict] | None = None) -> list[str]:
         out.append(f"{len(errors)} error record(s); first: {first.get('kind')}: "
                    f"{str(first.get('message', ''))[:100]}")
     out.extend(capture.problems[:3])
+    if len(capture.problems) > 3:
+        out.append(f"{len(capture.problems) - 3} more unreadable or malformed records")
     return out
 
 
@@ -597,14 +683,22 @@ def facts(capture: Capture) -> dict:
 
 def read(path: str | Path, mode: str = "summary", sop=None, types=None, since=None,
          limit=None, include_goodcrc: bool = False) -> dict:
-    """Load ``path`` and render it in ``mode``."""
+    """Load ``path`` and render it in ``mode``.
+
+    Raises ValueError for a file that cannot be read as a capture, including one whose
+    records are malformed in a way the loader's checks did not catch.
+    """
     if mode not in MODES:
         raise ValueError(f"mode must be one of {', '.join(MODES)}")
     capture = load_capture(path)
-    if mode == "summary":
-        return summary(capture)
-    if mode == "facts":
-        return facts(capture)
-    if mode == "messages":
-        return messages(capture, sop, types, since, limit, include_goodcrc)
-    return full(capture, sop, types, since, limit, include_goodcrc)
+    try:
+        if mode == "summary":
+            return summary(capture)
+        if mode == "facts":
+            return facts(capture)
+        if mode == "messages":
+            return messages(capture, sop, types, since, limit, include_goodcrc)
+        return full(capture, sop, types, since, limit, include_goodcrc)
+    except (AttributeError, TypeError, KeyError, IndexError) as exc:
+        raise ValueError(f"{capture.path}: malformed capture file "
+                         f"({type(exc).__name__}: {exc})") from exc
