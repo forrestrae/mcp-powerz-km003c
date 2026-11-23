@@ -32,8 +32,9 @@ log = logging.getLogger(__name__)
 RATE_INDEX = {2: 0, 10: 1, 50: 2, 1000: 3}
 VBUS_WARNING = ("Makes the attached charger raise VBUS on the meter's output; "
                 "disconnect sensitive loads first.")
-# Unset KM003C_IDLE_RELEASE_S: None keeps the meter claimed until the server exits.
-DEFAULT_IDLE_RELEASE_S: float | None = None
+# Unset KM003C_IDLE_RELEASE_S: release 2 s after the last lease ends, so a loop of measure
+# calls does not claim and release every time. Upstream keeps the claim (None) instead.
+DEFAULT_IDLE_RELEASE_S: float | None = 2.0
 # After a USB reset the meter re-enumerates; reopening is retried this often.
 RESET_REOPEN_ATTEMPTS = 10
 RESET_REOPEN_DELAY_S = 0.3
@@ -62,8 +63,8 @@ def idle_release_from_env() -> float | None:
 
 # pd_status during a capture waits this long for the capture's first status block.
 PD_STATUS_WAIT_S = 1.0
-# Unset KM003C_ENABLE_TRIGGER: True registers the trigger tools.
-DEFAULT_ENABLE_TRIGGER = True
+# Unset KM003C_ENABLE_TRIGGER: the trigger tools are not registered. Upstream registers them.
+DEFAULT_ENABLE_TRIGGER = False
 TRIGGER_TOOLS = ("trigger_detect", "trigger_enter", "trigger_pd_source_caps",
                  "trigger_pd_request", "trigger_fast_charge", "trigger_reset", "trigger_close",
                  "trigger_raw")

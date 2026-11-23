@@ -17,9 +17,9 @@ driver, so no extra driver is needed; `libusb-package` ships the libusb DLL.
 **Close the ChargerLab POWER-Z PC software first** — only one program can hold the
 meter's USB interface. The server reports `DeviceBusyError` otherwise, with the likely
 holders; on macOS it also names the holding process from `ioreg`, for example
-`pid 46945, python3.14`. By default the server keeps the meter claimed until it exits. Set
-`KM003C_IDLE_RELEASE_S`, or call `device_release`, to let another program use the meter
-while this server keeps running.
+`pid 46945, python3.14`. This server releases the meter 2 s after its last use, and
+`device_release` releases it at once, so another program can use the meter while this
+server keeps running.
 
 ### macOS and Linux
 
@@ -55,10 +55,16 @@ claude mcp add km003c -- <repo>\.venv\Scripts\km003c-mcp.exe
 |---|---|
 | `KM003C_SERIAL` | Pick a meter by USB serial number when several are attached |
 | `KM003C_COM_PORT` | Override the trigger's virtual serial port (e.g. `COM14`) |
-| `KM003C_ENABLE_TRIGGER` | `1` registers the `trigger_*` tools. Any other value, such as `0` or `false`, leaves every one of them out of the tool list, so an agent can neither see nor call them. Unset registers them |
-| `KM003C_IDLE_RELEASE_S` | Release the meter's USB interface this many seconds after the last tool call, PD capture, or stream that uses it ends; the next call claims it again. `0` releases at once. Unset, or `never`, keeps the meter claimed until the server exits |
+| `KM003C_ENABLE_TRIGGER` | `1` registers the `trigger_*` tools. Unset, or any other value such as `0` or `false`, leaves every one of them out of the tool list, so an agent can neither see nor call them |
+| `KM003C_IDLE_RELEASE_S` | Release the meter's USB interface this many seconds after the last tool call, PD capture, or stream that uses it ends; the next call claims it again. Unset gives 2. `0` releases at once; `never` keeps the meter claimed until the server exits |
 | `KM003C_PD_POLL_MS` | PD capture poll interval in milliseconds, 1 to 10000 (default 50; the meter buffers a whole negotiation between polls) |
 | `KM003C_LIBUSB` | Load libusb-1.0 from this file instead of the bundled one (`KM003C_LIBUSB_DLL` is the older name and still works) |
+
+This fork's defaults for two variables differ from upstream's. Unset in upstream,
+`KM003C_ENABLE_TRIGGER` registers the trigger tools and `KM003C_IDLE_RELEASE_S` keeps the
+meter claimed until the server exits. Here the trigger tools stay off unless explicitly
+enabled, and the meter is released 2 s after its last use. Set both variables explicitly
+to get the same behavior from either build.
 
 ## Tools
 
@@ -76,9 +82,9 @@ claude mcp add km003c -- <repo>\.venv\Scripts\km003c-mcp.exe
 | `trigger_reset` / `trigger_close` / `trigger_raw` | Reset, leave trigger mode, or send any documented command |
 
 Trigger requests make the charger raise VBUS on the meter's output — disconnect
-sensitive loads first. With `KM003C_ENABLE_TRIGGER=0` none of the trigger tools is
-registered, `trigger_detect` included, because protocol probing can also make a charger
-change VBUS.
+sensitive loads first. Unless `KM003C_ENABLE_TRIGGER=1` is set, none of the trigger
+tools is registered, `trigger_detect` included, because protocol probing can also make a
+charger change VBUS.
 
 Positive IBUS means current flows from the meter's USB-C receptacle (input) to its plug
 (output).
