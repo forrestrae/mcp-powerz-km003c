@@ -17,6 +17,28 @@ driver, so no extra driver is needed; `libusb-package` ships the libusb DLL.
 **Close the ChargerLab POWER-Z PC software first** — only one program can hold the
 meter's USB interface. The server reports `DeviceBusyError` otherwise.
 
+### macOS and Linux
+
+```sh
+uv sync --extra dev
+```
+
+The server loads libusb-1.0 in this order: the file named by `KM003C_LIBUSB`, the copy
+bundled with `libusb-package`, then the system library through pyusb's normal search.
+On macOS, including Apple Silicon, the bundled copy works without a driver or `sudo`.
+If it does not load, install Homebrew's libusb (`brew install libusb`); pyusb finds
+`/opt/homebrew/lib/libusb-1.0.dylib` on its own. On Linux, the user also needs read and
+write access to the meter's USB device node, usually through a udev rule for
+`5FC9:0063`.
+
+The trigger port is found by USB VID and PID, so on macOS it is the meter's
+`/dev/cu.usbmodem*` device even when other USB serial devices are attached. Register the
+server with Claude Code through `uv`:
+
+```sh
+claude mcp add km003c -- uv --directory <repo> run km003c-mcp
+```
+
 ## Register with Claude Code
 
 ```powershell
@@ -29,7 +51,7 @@ claude mcp add km003c -- <repo>\.venv\Scripts\km003c-mcp.exe
 |---|---|
 | `KM003C_SERIAL` | Pick a meter by USB serial number when several are attached |
 | `KM003C_COM_PORT` | Override the trigger's virtual serial port (e.g. `COM14`) |
-| `KM003C_LIBUSB_DLL` | Use a specific `libusb-1.0.dll` instead of the bundled one |
+| `KM003C_LIBUSB` | Load libusb-1.0 from this file instead of the bundled one (`KM003C_LIBUSB_DLL` is the older name and still works) |
 
 ## Tools
 
