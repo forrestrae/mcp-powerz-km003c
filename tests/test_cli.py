@@ -76,3 +76,17 @@ def test_record_exits_3_when_the_condition_is_not_met(monkeypatch, tmp_path, cap
     assert code == 3 and records(tmp_path / "t.jsonl")[-1]["reason"] == "timeout"
     # Without a stop condition, reaching the timeout is the expected end.
     assert main(["record", "--timeout", "0.3", str(tmp_path / "u.jsonl")]) == 0
+
+
+def test_summarize_and_facts_on_the_cold_attach(capsys):
+    cold = str(GOLDEN.parent / "cold_attach_fw2.0.0.jsonl")
+    assert main(["summarize", cold]) == 0
+    out = capsys.readouterr().out
+    assert "contract: pos 4, 3.0 A of 20.0 V 4.7 A; RDO 4184b12c, PDO 000641d6, PS_RDY t=40104470" \
+        in out
+    assert "t=40103694 connect (code 0x11) [450eef630211]" in out
+    assert main(["facts", cold]) == 0
+    facts = json.loads(capsys.readouterr().out)
+    assert facts["requests"][facts["contract"]["request_index"]]["rdo"]["object_position"] == 4
+    assert set(facts["discover_identity_acks"]["SOP"]) == {"sink/ufp"}
+    assert set(facts["discover_identity_acks"]["SOP'"]) == {"cable"}
