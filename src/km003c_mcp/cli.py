@@ -121,6 +121,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "record":
             return _record(args)
+    except (OSError, ValueError) as exc:
+        print(f"km003c-capture: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - report meter errors without a traceback
+        print(f"km003c-capture: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    try:
         capture = capture_read.load_capture(args.path)
         if args.command == "facts":
             print(json.dumps(capture_read.facts(capture), indent=1))
@@ -128,12 +135,10 @@ def main(argv: list[str] | None = None) -> int:
         summary = capture_read.summary(capture, args.max_bytes)
         print(json.dumps(summary, indent=1) if args.json else _summary_text(summary))
         return 0
-    except (OSError, ValueError) as exc:
-        print(f"km003c-capture: {exc}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - any failure to read the file is exit 2
+        print(f"km003c-capture: cannot read {args.path}: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
         return 2
-    except Exception as exc:  # noqa: BLE001 - report meter errors without a traceback
-        print(f"km003c-capture: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1
 
 
 if __name__ == "__main__":
