@@ -484,3 +484,75 @@ def test_stop_stream_releases_its_lease_when_the_link_fails():
     with pytest.raises(TransportError):
         rec.stop_stream()
     assert [e[0] for e in leases.events] == ["take", "release"]
+
+
+# --- stream and capture errors stay apart -------------------------------------------------
+
+BAD_ADC = LogicalPacket(ATT_ADCQUEUE, True, 1, bytes(7))  # not a multiple of 20 bytes
+
+
+def pd_reply():
+    return LogicalPacket(ATT_PD, False, 0, PD_STREAM[:12])
+
+
+def test_adc_parse_error_is_not_written_into_the_capture():
+    dev = FakeDevice([[BAD_ADC, pd_reply()]] * 3)
+    rec = Recorder(lambda: dev, poll_interval_s=0.001)
+    rec.start_stream(3)
+    rec.start_pd()
+    wait_until(lambda: len(dev.masks) > 5)
+    assert rec.pd_running and rec.stream_status()["running"]
+    rec.stop_pd()
+    rec.stop_stream()
+    assert not any(r["type"] == "error" for r in records(rec.capture_path))
+
+
+def test_repeated_adc_parse_errors_end_the_stream_not_the_capture():
+    from km003c_mcp.recorder import MAX_CONSECUTIVE_PROTOCOL_ERRORS
+    dev = FakeDevice([[BAD_ADC, pd_reply()]] * MAX_CONSECUTIVE_PROTOCOL_ERRORS)
+    rec = Recorder(lambda: dev, poll_interval_s=0.001)
+    rec.start_stream(3)
+    rec.start_pd()
+    wait_until(lambda: not rec.stream_status()["running"])
+    assert "polls in a row failed to parse" in rec.stream_status()["error"]
+    assert ("stop",) in dev.graph
+    time.sleep(0.02)
+    assert rec.pd_running and dev.monitor == ["enable"]
+    rec.stop_pd()
+
+
+def test_capture_file_failure_ends_the_capture_not_the_stream():
+    dev = FakeDevice()
+    rec = Recorder(lambda: dev, poll_interval_s=0.001)
+    rec.start_stream(3)
+    rec.start_pd()
+
+    def full(record):
+        raise OSError(28, "No space left on device")
+    rec._pd.writer.write = full
+    dev.replies = [[pd_reply()]]
+    wait_until(lambda: not rec.pd_running)
+    assert "No space left" in rec.pd_capture_state()["error"]
+    assert dev.monitor == ["enable", "disable"]
+    time.sleep(0.02)
+    assert rec.stream_status()["running"] and dev.graph == [("start", 3)]
+    rec.stop_stream()
+
+
+def test_csv_failure_ends_the_stream_not_the_capture(tmp_path):
+    dev = FakeDevice()
+    rec = Recorder(lambda: dev, poll_interval_s=0.001)
+    rec.start_stream(3, csv_path=str(tmp_path / "s.csv"))
+    rec.start_pd()
+
+    class FullCsv:
+        def writerow(self, row):
+            raise OSError(28, "No space left on device")
+    rec._stream._csv = FullCsv()
+    dev.replies = [queue(range(0, 5))]
+    wait_until(lambda: not rec.stream_status()["running"])
+    assert "No space left" in rec.stream_status()["error"]
+    time.sleep(0.02)
+    assert rec.pd_running and dev.monitor == ["enable"]
+    rec.stop_pd()
+    assert records(rec.capture_path)[-1]["reason"] == "manual"
