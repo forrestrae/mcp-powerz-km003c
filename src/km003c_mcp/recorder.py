@@ -158,12 +158,25 @@ def pd_poll_interval_s() -> float:
     return clamped / 1000
 
 
+class _NoLease:
+    def release(self) -> None:
+        pass
+
+
 class Recorder:
     def __init__(self, device_provider: Callable[[], Km003cDevice],
                  poll_interval_s: float | None = None, keep_samples: int = 10_000,
-                 on_transport_error: Callable[[], None] | None = None) -> None:
-        """``poll_interval_s`` defaults to :func:`pd_poll_interval_s`."""
+                 on_transport_error: Callable[[], None] | None = None,
+                 lease: Callable[[str], object] | None = None) -> None:
+        """``poll_interval_s`` defaults to :func:`pd_poll_interval_s`.
+
+        ``lease(holder)`` returns an object with ``release()``. A running stream and a running
+        PD capture each hold one, so the device owner keeps the meter claimed until they stop.
+        """
         self._provider = device_provider
+        self._take_lease = lease or (lambda holder: _NoLease())
+        self._stream_lease = None
+        self._pd_lease = None
         self._on_transport_error = on_transport_error
         self._poll = pd_poll_interval_s() if poll_interval_s is None else poll_interval_s
         self._keep = keep_samples
@@ -234,10 +247,13 @@ class Recorder:
         Returns whether a stream was running.
         """
         with self._state:
-            return self._abort_locked(reason)[0]
+            had_stream, _, leases = self._abort_locked(reason)
+        for lease in leases:
+            lease.release()
+        return had_stream
 
-    def _abort_locked(self, reason: str) -> tuple[bool, bool]:
-        """Mark the stream and capture failed; return whether each was running."""
+    def _abort_locked(self, reason: str) -> tuple[bool, bool, list]:
+        """Mark the stream and capture failed; return whether each ran and their leases."""
         had_stream = self._stream is not None
         had_pd = self._pd_active
         if self._stream:
@@ -248,40 +264,48 @@ class Recorder:
         if self._pd_active:
             self._pd_active = False
             self._pd_error = reason
-        return had_stream, had_pd
+        leases = [lease for lease in (self._stream_lease, self._pd_lease) if lease is not None]
+        self._stream_lease = self._pd_lease = None
+        return had_stream, had_pd, leases
 
     def _fail(self, exc: Exception) -> None:
         with self._state:
-            had_stream, had_pd = self._abort_locked(f"{type(exc).__name__}: {exc}")
+            had_stream, had_pd, leases = self._abort_locked(f"{type(exc).__name__}: {exc}")
             stream_gen, pd_gen = self._stream_gen, self._pd_gen
             # Stop being the poller now: a start during the cleanup below gets a new thread.
             if self._thread is threading.current_thread():
                 self._thread = None
         device = self._device
-        if isinstance(exc, TransportError):
-            # The USB session is gone; let the owner drop it so the next call reopens.
-            if self._on_transport_error is not None:
-                self._on_transport_error()
-            return
-        if device is None:
-            return
-        # The link still works, so stop the firmware stream and PD monitor instead of leaving
-        # them running. Holding the device lock orders these commands against a new start:
-        # one that began before the check below is skipped, a later one runs after them.
-        with device.lock:
-            with self._state:
-                stream_current = self._stream_gen == stream_gen
-                pd_current = self._pd_gen == pd_gen
-            if had_stream and stream_current:
-                try:
-                    device.stop_graph()
-                except Exception:  # noqa: BLE001 - best effort
-                    device.graph_rate = None
-            if had_pd and pd_current:
-                try:
-                    device.disable_pd_monitor()
-                except Exception:  # noqa: BLE001 - best effort
-                    pass
+        try:
+            if isinstance(exc, TransportError):
+                # The USB session is gone; let the owner drop it so the next call reopens.
+                if self._on_transport_error is not None:
+                    self._on_transport_error()
+                return
+            if device is None:
+                return
+            # The link still works, so stop the firmware stream and PD monitor instead of
+            # leaving them running. Holding the device lock orders these commands against a
+            # new start: one that began before the check below is skipped, a later one runs
+            # after them.
+            with device.lock:
+                with self._state:
+                    stream_current = self._stream_gen == stream_gen
+                    pd_current = self._pd_gen == pd_gen
+                if had_stream and stream_current:
+                    try:
+                        device.stop_graph()
+                    except Exception:  # noqa: BLE001 - best effort
+                        device.graph_rate = None
+                if had_pd and pd_current:
+                    try:
+                        device.disable_pd_monitor()
+                    except Exception:  # noqa: BLE001 - best effort
+                        pass
+        finally:
+            # Only now may the owner release the meter: the cleanup above still uses it.
+            for lease in leases:
+                lease.release()
 
     # --- AdcQueue stream -------------------------------------------------------------
 
@@ -295,31 +319,41 @@ class Recorder:
         stream = _Stream(rate_index, csv_path, self._keep)
         with self._state:
             self._stream_gen += 1
+        lease = self._take_lease("stream")
         try:
             device = self._provider()
             device.start_graph(rate_index)
         except BaseException:
             stream.close()
+            lease.release()
             raise
         with self._state:
             self._device = device
             self._stream = stream
             self._stream_error = None
+            previous, self._stream_lease = self._stream_lease, lease
             self._ensure_thread_locked()
+        if previous is not None:
+            previous.release()
 
     def stop_stream(self) -> StreamStats:
         with self._state:
             stream, self._stream = self._stream, None
+            lease, self._stream_lease = self._stream_lease, None
             device = self._device
         if stream is None:
             if self._last_stats is None:
                 raise Km003cError("no stream is running")
             return self._last_stats
-        stream.close()
-        self._last_stats = stream.stats
-        self._join_if_idle()
-        if device is not None:
-            device.stop_graph()
+        try:
+            stream.close()
+            self._last_stats = stream.stats
+            self._join_if_idle()
+            if device is not None:
+                device.stop_graph()
+        finally:
+            if lease is not None:
+                lease.release()
         return stream.stats
 
     def stream_status(self) -> dict:
@@ -362,8 +396,13 @@ class Recorder:
         """
         with self._state:
             self._pd_gen += 1
-        device = self._provider()
-        monitor = device.enable_pd_monitor()
+        lease = self._take_lease("pd capture")
+        try:
+            device = self._provider()
+            monitor = device.enable_pd_monitor()
+        except BaseException:
+            lease.release()
+            raise
         with self._state:
             self._device = device
             self._pd_active = True
@@ -371,23 +410,31 @@ class Recorder:
             self._pd_events = []
             self._pd_decoder = PdDecoder()
             self._pd_monitor = monitor
+            previous, self._pd_lease = self._pd_lease, lease
             self._ensure_thread_locked()
+        if previous is not None:
+            previous.release()
         return monitor
 
     def stop_pd(self) -> None:
         """Stop polling and disable the PD monitor; it does not survive a release anyway."""
         with self._state:
             was_active, self._pd_active = self._pd_active, False
+            lease, self._pd_lease = self._pd_lease, None
             device = self._device
-        self._join_if_idle()
-        if not was_active or device is None:
-            return
         try:
-            device.disable_pd_monitor()
-        except TransportError:
-            raise
-        except Km003cError as exc:
-            log.warning("DisablePdMonitor failed: %s", exc)
+            self._join_if_idle()
+            if not was_active or device is None:
+                return
+            try:
+                device.disable_pd_monitor()
+            except TransportError:
+                raise
+            except Km003cError as exc:
+                log.warning("DisablePdMonitor failed: %s", exc)
+        finally:
+            if lease is not None:
+                lease.release()
 
     @property
     def pd_monitor(self) -> PdMonitorEnable | None:

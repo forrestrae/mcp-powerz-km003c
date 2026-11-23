@@ -254,6 +254,7 @@ class PyUsbTransport:
     def __init__(self, dev, serial_number: str) -> None:
         self._dev = dev
         self.serial_number = serial_number
+        self._closed = False
 
     @classmethod
     def open(cls, serial: str | None = None,
@@ -290,7 +291,14 @@ class PyUsbTransport:
             raise busy_error(exc, dev_serial, lookup(dev_serial)) from exc
         return cls(dev, _serial_of(dev))
 
+    def _check_open(self) -> None:
+        # pyusb reopens the handle and claims the interface again on any transfer after
+        # dispose_resources, so a stale session would silently take the meter back.
+        if self._closed:
+            raise TransportError("the USB session was released")
+
     def write(self, data: bytes, timeout_ms: int) -> None:
+        self._check_open()
         try:
             self._dev.write(EP_OUT, data, timeout=timeout_ms)
         except usb.core.USBTimeoutError as exc:
@@ -299,6 +307,7 @@ class PyUsbTransport:
             raise TransportError(f"USB write failed: {exc}") from exc
 
     def read(self, size: int, timeout_ms: int) -> bytes:
+        self._check_open()
         try:
             return bytes(self._dev.read(EP_IN, size, timeout=timeout_ms))
         except usb.core.USBTimeoutError as exc:
@@ -307,6 +316,9 @@ class PyUsbTransport:
             raise TransportError(f"USB read failed: {exc}") from exc
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         try:
             usb.util.release_interface(self._dev, INTERFACE)
         except usb.core.USBError:
@@ -315,6 +327,7 @@ class PyUsbTransport:
 
     def reset(self) -> None:
         """Reset the meter's USB device (``libusb_reset_device``); the meter re-enumerates."""
+        self._closed = True
         try:
             self._dev.reset()
         except usb.core.USBError as exc:
@@ -335,6 +348,8 @@ class Km003cDevice:
         self.lock = threading.RLock()
         self.graph_rate: int | None = None
         self.auth_level: int | None = None
+        # Set once EnablePdMonitor was answered, so a release can disable it again.
+        self.pd_monitor_enabled = False
         self._tid = 0
 
     @property
@@ -450,8 +465,10 @@ class Km003cDevice:
                     continue
             last_reply = reply[:4].hex()
             if _cmd(reply) == CMD_ACCEPT:
+                self.pd_monitor_enabled = True
                 return PdMonitorEnable(True, "accepted", attempt, last_reply)
             if _cmd(reply) == CMD_REJECT:
+                self.pd_monitor_enabled = True
                 log.info("EnablePdMonitor answered Reject: already enabled or refused")
                 return PdMonitorEnable(False, "already enabled or refused", attempt, last_reply)
             last_error = CommandRejectedError(
@@ -466,6 +483,7 @@ class Km003cDevice:
             reply = self._control(CMD_DISABLE_PD_MONITOR, 0)
             if _cmd(reply) not in (CMD_ACCEPT, CMD_REJECT):
                 raise CommandRejectedError(f"DisablePdMonitor answered with 0x{_cmd(reply):02x}")
+            self.pd_monitor_enabled = False
             return _cmd(reply) == CMD_ACCEPT
 
     def get_data(self, attribute_mask: int) -> list[LogicalPacket]:
@@ -549,11 +567,26 @@ class Km003cDevice:
             self.graph_rate = None
 
     def close(self) -> None:
+        """End the session: DisablePdMonitor and StopGraph if active, Disconnect, release.
+
+        Each step is best effort, and the interface is released whatever a step raises.
+        """
         with self.lock:
             try:
+                steps = []
+                if self.pd_monitor_enabled:
+                    steps.append(self.disable_pd_monitor)
                 if self.graph_rate is not None:
-                    self.stop_graph()
-                self.disconnect()
-            except Km003cError:
-                pass
-            self.transport.close()
+                    steps.append(self.stop_graph)
+                steps.append(self.disconnect)
+                for step in steps:
+                    try:
+                        step()
+                    except Km003cError as exc:
+                        log.debug("%s failed while closing: %s", step.__name__, exc)
+                        if isinstance(exc, TransportError):
+                            break
+            finally:
+                self.pd_monitor_enabled = False
+                self.graph_rate = None
+                self.transport.close()
