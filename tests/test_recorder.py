@@ -556,3 +556,53 @@ def test_csv_failure_ends_the_stream_not_the_capture(tmp_path):
     assert rec.pd_running and dev.monitor == ["enable"]
     rec.stop_pd()
     assert records(rec.capture_path)[-1]["reason"] == "manual"
+
+
+def test_manual_stop_does_not_disable_a_newer_captures_monitor():
+    class Dev(FakeDevice):
+        """enable and disable take the device lock; polling does not."""
+
+        def enable_pd_monitor(self):
+            with self.lock:
+                return super().enable_pd_monitor()
+
+        def disable_pd_monitor(self):
+            with self.lock:
+                return super().disable_pd_monitor()
+
+    dev = Dev()
+    rec = Recorder(lambda: dev, poll_interval_s=0.001)
+    rec.start_pd()
+    first = rec.capture_path
+    with dev.lock:
+        stopper = threading.Thread(target=rec.stop_pd)
+        stopper.start()
+        wait_until(lambda: not rec.pd_running)
+        time.sleep(0.05)  # the stop is now waiting for the device lock
+        rec.start_pd()  # a new capture enables the monitor before the old stop disables it
+    stopper.join(3)
+    assert dev.monitor == ["enable", "enable"]  # the old stop's disable was skipped
+    assert rec.pd_running and rec.capture_path != first
+    assert records(first)[-1]["reason"] == "manual"
+    rec.stop_pd()
+    assert dev.monitor == ["enable", "enable", "disable"]
+
+
+def test_wait_returns_after_a_manual_stop_has_disabled_the_monitor():
+    release = threading.Event()
+
+    class SlowDisable(FakeDevice):
+        def disable_pd_monitor(self):
+            release.wait(2)
+            return super().disable_pd_monitor()
+
+    dev = SlowDisable()
+    rec = Recorder(lambda: dev, poll_interval_s=0.001)
+    rec.start_pd()
+    stopper = threading.Thread(target=rec.stop_pd)
+    stopper.start()
+    wait_until(lambda: not rec.pd_running)
+    assert rec.wait_pd(0.05) is False  # the disable has not gone out yet
+    release.set()
+    assert rec.wait_pd(2) is True and dev.monitor == ["enable", "disable"]
+    stopper.join(2)

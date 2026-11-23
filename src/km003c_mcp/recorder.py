@@ -611,28 +611,41 @@ class Recorder:
     def stop_pd(self) -> Path | None:
         """Stop the capture (footer reason ``manual``) and disable the PD monitor.
 
-        Returns the path of the capture that was running, or None when none was.
+        Returns the path of the capture that was running, or None when none was. Waiters in
+        :meth:`wait_pd` return once the monitor is disabled and the lease released. A capture
+        started meanwhile keeps its monitor: the disable is skipped when a newer start
+        already ran.
         """
         with self._state:
             was_active, self._pd_active = self._pd_active, False
             lease, self._pd_lease = self._pd_lease, None
             device = self._device
+            gen = self._pd_gen
             if was_active:
+                self._pd_ending = True
                 self._close_capture_locked("manual")
             path = self._pd.path if was_active else None
         try:
             self._join_if_idle()
             if not was_active or device is None:
                 return path
-            try:
-                device.disable_pd_monitor()
-            except TransportError:
-                raise
-            except Km003cError as exc:
-                log.warning("DisablePdMonitor failed: %s", exc)
+            # Holding the device lock orders the disable against a new start's enable, as in
+            # _end_pd: a start that already ran is detected below, a later one runs after.
+            with device.lock:
+                with self._state:
+                    if self._pd_gen != gen:
+                        return path
+                try:
+                    device.disable_pd_monitor()
+                except TransportError:
+                    raise
+                except Km003cError as exc:
+                    log.warning("DisablePdMonitor failed: %s", exc)
         finally:
             if lease is not None:
                 lease.release()
+            if was_active:
+                self._pd_cleanup_done()
         return path
 
     def wait_pd(self, timeout_s: float) -> bool:
