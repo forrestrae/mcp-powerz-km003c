@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import functools
 import inspect
 import logging
+import os
 import threading
 import time
+from collections import Counter
 from dataclasses import asdict
 from types import SimpleNamespace
 from typing import Callable, Literal
@@ -29,27 +32,195 @@ log = logging.getLogger(__name__)
 RATE_INDEX = {2: 0, 10: 1, 50: 2, 1000: 3}
 VBUS_WARNING = ("Makes the attached charger raise VBUS on the meter's output; "
                 "disconnect sensitive loads first.")
+# Unset KM003C_IDLE_RELEASE_S: None keeps the meter claimed until the server exits.
+DEFAULT_IDLE_RELEASE_S: float | None = None
 # After a USB reset the meter re-enumerates; reopening is retried this often.
 RESET_REOPEN_ATTEMPTS = 10
 RESET_REOPEN_DELAY_S = 0.3
 
 
+def idle_release_from_env() -> float | None:
+    """Seconds the meter stays claimed after its last lease ends, from ``KM003C_IDLE_RELEASE_S``.
+
+    ``0`` releases as soon as the last lease ends. ``never`` (or ``off``) holds the claim
+    until the server exits. Unset or invalid gives :data:`DEFAULT_IDLE_RELEASE_S`.
+    """
+    raw = os.environ.get("KM003C_IDLE_RELEASE_S", "").strip().lower()
+    if not raw:
+        return DEFAULT_IDLE_RELEASE_S
+    if raw in ("never", "off"):
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        seconds = -1.0
+    if not seconds >= 0:
+        log.warning("ignoring KM003C_IDLE_RELEASE_S=%r", raw)
+        return DEFAULT_IDLE_RELEASE_S
+    return seconds
+
+
+def _daemon_timer(delay_s: float, fn: Callable[[], None]) -> threading.Timer:
+    timer = threading.Timer(delay_s, fn)
+    timer.daemon = True
+    return timer
+
+
+class Lease:
+    """A claim on the meter. The USB interface stays claimed while any lease is held.
+
+    Use it as a context manager for the length of a call, or keep it and call
+    :meth:`release` when a capture or stream stops. Releasing twice is harmless.
+    """
+
+    def __init__(self, service: Km003cService, holder: str) -> None:
+        self.holder = holder
+        self._service = service
+        self._held = True
+
+    def release(self) -> None:
+        self._service._end_lease(self)
+
+    def __enter__(self) -> Lease:
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
+
+_FROM_ENV = object()
+
+
 class Km003cService:
-    """Owns the lazily opened USB session, the trigger port and the background recorder."""
+    """Owns the USB session, the trigger port and the background recorder.
+
+    The meter is claimed on demand. Every user of the device holds a :class:`Lease`; when the
+    last one ends, the interface is released after ``idle_release_s`` seconds (0 at once,
+    None never). A call that arrives while a release runs waits for it, then reopens.
+    """
 
     def __init__(self, transport_factory: Callable = PyUsbTransport.open,
                  trigger_factory: Callable[[str], TriggerPort] = TriggerPort,
-                 port_finder: Callable = find_trigger_port) -> None:
+                 port_finder: Callable = find_trigger_port,
+                 idle_release_s: float | None | object = _FROM_ENV,
+                 timer_factory: Callable[[float, Callable[[], None]], threading.Timer] = _daemon_timer,
+                 ) -> None:
         self._transport_factory = transport_factory
         self._trigger_factory = trigger_factory
         self._port_finder = port_finder
+        self.idle_release_s = idle_release_from_env() if idle_release_s is _FROM_ENV \
+            else idle_release_s
+        self._timer_factory = timer_factory
         self._lock = threading.RLock()
+        self._released = threading.Condition(self._lock)
         self._device: Km003cDevice | None = None
         self._trigger: TriggerPort | None = None
-        self.recorder = Recorder(self.device, on_transport_error=self.invalidate_device)
+        self._leases: Counter[str] = Counter()
+        self._releasing = False
+        self._timer = None
+        self.recorder = Recorder(self.device, on_transport_error=self.invalidate_device,
+                                 lease=self.lease)
+
+    # --- leases and release ------------------------------------------------------------
+
+    def lease(self, holder: str = "call") -> Lease:
+        """Take a lease; it waits while a release is in progress."""
+        with self._released:
+            while self._releasing:
+                self._released.wait()
+            self._cancel_timer_locked()
+            self._leases[holder] += 1
+            return Lease(self, holder)
+
+    def leases(self) -> dict[str, int]:
+        """Current lease holders and counts."""
+        with self._lock:
+            return dict(+self._leases)
+
+    @property
+    def claimed(self) -> bool:
+        with self._lock:
+            return self._device is not None
+
+    def _end_lease(self, lease: Lease) -> None:
+        with self._lock:
+            if not lease._held:
+                return
+            lease._held = False
+            self._leases[lease.holder] -= 1
+            if self._leases[lease.holder] <= 0:
+                del self._leases[lease.holder]
+            if self._leases or self._device is None or self.idle_release_s is None:
+                return
+            if self.idle_release_s > 0:
+                self._cancel_timer_locked()
+                timer = self._timer_factory(self.idle_release_s, lambda: self._on_timer(timer))
+                self._timer = timer
+                timer.start()
+                return
+            device = self._begin_release_locked()
+        self._finish_release(device)
+
+    def _cancel_timer_locked(self) -> None:
+        timer, self._timer = self._timer, None
+        if timer is not None:
+            timer.cancel()
+
+    def _on_timer(self, timer) -> None:
+        with self._lock:
+            # A lease taken after the timer started cancelled it; a cancelled timer can still
+            # fire once if it was already waiting for the lock.
+            if timer is not self._timer or self._leases:
+                return
+            self._timer = None
+            device = self._begin_release_locked()
+        self._finish_release(device)
+
+    def _begin_release_locked(self) -> Km003cDevice | None:
+        self._cancel_timer_locked()
+        device, self._device = self._device, None
+        if device is not None:
+            self._releasing = True
+        return device
+
+    def _finish_release(self, device: Km003cDevice | None) -> None:
+        if device is None:
+            return
+        try:
+            device.close()
+            log.info("released the KM003C")
+        except Exception as exc:  # noqa: BLE001 - the interface is dropped either way
+            log.warning("releasing the KM003C failed: %s", exc)
+        finally:
+            with self._released:
+                self._releasing = False
+                self._released.notify_all()
+
+    def release(self) -> bool:
+        """Release the meter now. Returns False if it was not claimed.
+
+        Refuses with :class:`Km003cError` while a capture, a stream, or another call holds a
+        lease, because releasing would cut that work off.
+        """
+        with self._released:
+            while self._releasing:
+                self._released.wait()
+            if self._leases:
+                holders = ", ".join(sorted(self._leases))
+                raise Km003cError(
+                    f"the meter is in use ({holders}); stop a running capture or stream, "
+                    "or retry once the other call ends")
+            device = self._begin_release_locked()
+        self._finish_release(device)
+        return device is not None
+
+    # --- device ------------------------------------------------------------------------
 
     def device(self) -> Km003cDevice:
-        with self._lock:
+        """The open session, opened on first use. Callers hold a lease while they use it."""
+        with self._released:
+            while self._releasing:
+                self._released.wait()
             if self._device is None:
                 device = self._open_device()
                 try:
@@ -114,6 +285,7 @@ class Km003cService:
     def invalidate_device(self) -> None:
         """Drop a broken USB session; the next call opens a fresh one."""
         with self._lock:
+            self._cancel_timer_locked()
             device, self._device = self._device, None
         if device is None:
             return
@@ -126,7 +298,8 @@ class Km003cService:
 
     def usb_serial(self) -> str | None:
         try:
-            return self.device().serial_number or None
+            with self.lease("trigger port lookup"):
+                return self.device().serial_number or None
         except Km003cError:
             return None
 
@@ -154,36 +327,44 @@ class Km003cService:
                 step()
             except Exception:  # noqa: BLE001
                 pass
-        with self._lock:
-            device, self._device = self._device, None
-        if device is not None:
-            device.close()
+        with self._released:
+            while self._releasing:
+                self._released.wait()
+            device = self._begin_release_locked()
+        self._finish_release(device)
 
 
 def build_tools(service: Km003cService) -> SimpleNamespace:
     """Create the tool callables; errors come back as {"error", "kind"} dicts."""
 
-    def safe(fn):
+    def safe(fn, claims_meter: bool = False):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
-            try:
-                return fn(*args, **kwargs)
-            except TransportError as exc:
-                service.invalidate_device()
-                return {"error": str(exc), "kind": type(exc).__name__}
-            except serial.SerialException as exc:
-                service.invalidate_trigger()
-                return {"error": str(exc), "kind": type(exc).__name__}
-            except (Km003cError, ValueError, OSError) as exc:
-                return {"error": str(exc), "kind": type(exc).__name__}
+            # The lease ends after a broken session is dropped, so release never touches it.
+            lease = service.lease(fn.__name__) if claims_meter else contextlib.nullcontext()
+            with lease:
+                try:
+                    return fn(*args, **kwargs)
+                except TransportError as exc:
+                    service.invalidate_device()
+                    return {"error": str(exc), "kind": type(exc).__name__}
+                except serial.SerialException as exc:
+                    service.invalidate_trigger()
+                    return {"error": str(exc), "kind": type(exc).__name__}
+                except (Km003cError, ValueError, OSError) as exc:
+                    return {"error": str(exc), "kind": type(exc).__name__}
         return wrapper
+
+    def meter(fn):
+        """Like ``safe``, holding a lease on the meter for the length of the call."""
+        return safe(fn, claims_meter=True)
 
     def trigger_run(command: str, timeout_s: float = 3.0) -> dict:
         port = service.trigger()
         port.ensure_open()
         return {"command": command, "lines": port.command(command, timeout_s=timeout_s)}
 
-    @safe
+    @meter
     def device_info() -> dict:
         """Identify the attached KM003C: model, hardware/firmware version, serial, trigger port."""
         device = service.device()
@@ -195,7 +376,7 @@ def build_tools(service: Km003cService) -> SimpleNamespace:
             info["trigger_port"] = None
         return info
 
-    @safe
+    @meter
     def measure(samples: int = 1, interval_ms: int = 100) -> dict:
         """Read VBUS/IBUS/power, CC1/CC2, D+/D-, VDD and temperature (V, A, W, °C).
 
@@ -219,7 +400,7 @@ def build_tools(service: Km003cService) -> SimpleNamespace:
         out["last"] = readings[-1]
         return out
 
-    @safe
+    @meter
     def pd_status() -> dict:
         """Read the PD-side status snapshot (timestamp, VBUS, IBUS, CC1, CC2).
 
@@ -234,7 +415,7 @@ def build_tools(service: Km003cService) -> SimpleNamespace:
             return out
         return asdict(result)
 
-    @safe
+    @meter
     def stream_start(rate_sps: Literal[2, 10, 50, 1000] = 1000, csv_path: str | None = None) -> dict:
         """Start high-rate VBUS/IBUS sampling in the background (2, 10, 50 or 1000 samples/s).
 
@@ -256,12 +437,12 @@ def build_tools(service: Km003cService) -> SimpleNamespace:
         """Return up to max_samples evenly spaced samples from the running stream's buffer."""
         return {"samples": service.recorder.stream_samples(max_samples)}
 
-    @safe
+    @meter
     def stream_stop() -> dict:
         """Stop the stream and return its statistics."""
         return service.recorder.stop_stream().to_dict()
 
-    @safe
+    @meter
     def pd_capture_start() -> dict:
         """Start capturing USB PD traffic (messages, attach/detach) in the background.
 
@@ -276,11 +457,20 @@ def build_tools(service: Km003cService) -> SimpleNamespace:
         """Page through captured PD events from index `since`; `next` is the next index to ask."""
         return service.recorder.pd_events(since, limit, decode)
 
-    @safe
+    @meter
     def pd_capture_stop() -> dict:
         """Stop the PD capture; captured events stay readable until the next start."""
         service.recorder.stop_pd()
         return {"stopped": True, "total": service.recorder.pd_events(limit=0)["total"]}
+
+    @safe
+    def device_release() -> dict:
+        """Release the meter's USB interface now, so another program can claim it.
+
+        Refused while a PD capture or a stream runs; stop it first. The next tool that needs
+        the meter claims it again. released is False when the meter was not claimed.
+        """
+        return {"released": service.release()}
 
     @safe
     def trigger_detect(extended: bool = False, timeout_s: float = 15) -> dict:
@@ -337,9 +527,9 @@ def build_tools(service: Km003cService) -> SimpleNamespace:
 
     return SimpleNamespace(**{fn.__name__: fn for fn in (
         device_info, measure, pd_status, stream_start, stream_status, stream_samples,
-        stream_stop, pd_capture_start, pd_capture_read, pd_capture_stop, trigger_detect,
-        trigger_enter, trigger_pd_source_caps, trigger_pd_request, trigger_fast_charge,
-        trigger_reset, trigger_close, trigger_raw)})
+        stream_stop, pd_capture_start, pd_capture_read, pd_capture_stop, device_release,
+        trigger_detect, trigger_enter, trigger_pd_source_caps, trigger_pd_request,
+        trigger_fast_charge, trigger_reset, trigger_close, trigger_raw)})
 
 
 service = Km003cService()

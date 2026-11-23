@@ -1,5 +1,7 @@
 """Shared fixtures and fake transports for the KM003C tests."""
 
+import threading
+
 # GetData(ADC) response captured live from a KM003C (SN 014270) with no load attached.
 LIVE_ADC = bytes.fromhex(
     "41028002" "0100000b"
@@ -36,6 +38,71 @@ class FakeTransport:
         return item
 
     def close(self) -> None:
+        self.closed = True
+
+    def reset(self) -> None:
+        self.resets += 1
+        self.closed = True
+
+
+class MeterFake:
+    """UsbTransport that answers like an idle KM003C on firmware 2.0.0.
+
+    Each request queues its reply when written: Accept for Connect, StartGraph and the PD
+    monitor commands, Reject for StopGraph, the live ADC block or an empty PutData for
+    GetData, and ``03 11 00 00`` for Disconnect. ``hold_disconnect`` is an Event the
+    Disconnect reply waits for. ``on_close`` runs when the session is released.
+    """
+
+    def __init__(self, serial_number="TEST", hold_disconnect: threading.Event | None = None,
+                 on_close=None):
+        self.serial_number = serial_number
+        self.hold_disconnect = hold_disconnect
+        self.on_close = on_close
+        self.writes: list[bytes] = []
+        self.writes_after_close: list[bytes] = []
+        self.pending: list[bytes] = []
+        self.closed = False
+        self.resets = 0
+        self._lock = threading.Lock()
+
+    def commands(self) -> list[int]:
+        return [w[0] & 0x7F for w in self.writes]
+
+    def write(self, data: bytes, timeout_ms: int) -> None:
+        import struct
+
+        from km003c_mcp import protocol as p
+        if self.closed:
+            self.writes_after_close.append(bytes(data))
+        self.writes.append(bytes(data))
+        cmd, tid = data[0] & 0x7F, data[1]
+        attribute = (struct.unpack_from("<I", data)[0] >> 17) & 0x7FFF
+        if cmd == p.CMD_STOP_GRAPH:
+            reply = bytes([p.CMD_REJECT, tid, 0, 0])
+        elif cmd == p.CMD_DISCONNECT:
+            if self.hold_disconnect is not None:
+                self.hold_disconnect.wait(5)
+            reply = bytes.fromhex("03110000")
+        elif cmd == p.CMD_GET_DATA and attribute & p.ATT_ADC:
+            reply = live_adc_with_tid(tid)
+        elif cmd == p.CMD_GET_DATA:
+            reply = bytes([p.CMD_PUT_DATA, tid, 0, 0])
+        else:
+            reply = bytes([p.CMD_ACCEPT, tid, 0, 0])
+        with self._lock:
+            self.pending.append(reply)
+
+    def read(self, size: int, timeout_ms: int) -> bytes:
+        from km003c_mcp.usb_device import DeviceTimeoutError
+        with self._lock:
+            if self.pending:
+                return self.pending.pop(0)
+        raise DeviceTimeoutError("fake meter: no reply pending")
+
+    def close(self) -> None:
+        if self.on_close is not None:
+            self.on_close(self)
         self.closed = True
 
     def reset(self) -> None:

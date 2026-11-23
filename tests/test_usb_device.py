@@ -8,7 +8,7 @@ from fakes import FakeTransport, live_adc_with_tid, memory_read_replies
 from km003c_mcp.crypto import ADDR_HARDWARE_ID
 from km003c_mcp.usb_device import (
     DeviceBusyError, DeviceNotFoundError, DeviceTimeoutError, Km003cDevice, Km003cError,
-    MeterLaggingError, PdMonitorNotEnabledError, PyUsbTransport,
+    MeterLaggingError, PdMonitorNotEnabledError, PyUsbTransport, TransportError,
 )
 
 HWID = bytes.fromhex("3037314b42500dff110affff")
@@ -54,6 +54,47 @@ def test_connect_timeouts_without_late_replies_are_a_plain_failure():
     with pytest.raises(Km003cError, match="cannot connect") as info:
         Km003cDevice(FakeTransport([])).connect()
     assert not isinstance(info.value, MeterLaggingError)
+
+
+def test_close_disables_pd_monitor_and_stops_graph_before_disconnect():
+    t = FakeTransport([bytes.fromhex("05010000"), bytes.fromhex("05020000"),
+                       bytes.fromhex("05030000"), bytes.fromhex("03110000")])
+    dev = Km003cDevice(t)
+    dev.pd_monitor_enabled = True
+    dev.graph_rate = 3
+    dev.close()
+    assert [w[0] for w in t.writes] == [0x11, 0x0F, 0x03] and t.closed
+    assert not dev.pd_monitor_enabled and dev.graph_rate is None
+
+
+def test_close_releases_whatever_a_step_raises():
+    class Exploding(FakeTransport):
+        def write(self, data, timeout_ms):
+            raise RuntimeError("backend bug")
+
+    t = Exploding([])
+    dev = Km003cDevice(t)
+    with pytest.raises(RuntimeError):
+        dev.close()
+    assert t.closed
+
+
+def test_close_releases_even_when_the_link_fails():
+    t = FakeTransport([])
+    dev = Km003cDevice(t)
+    dev.pd_monitor_enabled = True
+    dev.close()
+    assert [w[0] for w in t.writes] == [0x11] and t.closed  # no Disconnect after a timeout
+
+
+def test_pd_monitor_flag_follows_enable_and_disable():
+    t = FakeTransport([bytes.fromhex("05010000"), bytes.fromhex("06020000"),
+                       bytes.fromhex("05030000")])
+    dev = Km003cDevice(t)
+    dev.enable_pd_monitor()
+    assert dev.pd_monitor_enabled  # Reject means already enabled
+    dev.disable_pd_monitor()
+    assert not dev.pd_monitor_enabled
 
 
 UNMATCHED = bytes.fromhex("41990000")
@@ -243,11 +284,28 @@ class ResettableUsb:
     def reset(self):
         self.calls.append("reset")
 
+    def write(self, *args, **kwargs):
+        self.calls.append("write")
+
 
 def test_transport_reset_resets_and_disposes(disposed):
     dev = ResettableUsb()
     PyUsbTransport(dev, "A").reset()
     assert dev.calls == ["reset"] and disposed == [dev]
+
+
+def test_released_transport_refuses_transfers(monkeypatch, disposed):
+    # pyusb would reopen the handle and claim the interface again on a transfer.
+    monkeypatch.setattr(usb.util, "release_interface", lambda dev, intf: None)
+    dev = ResettableUsb()
+    t = PyUsbTransport(dev, "A")
+    t.close()
+    t.close()
+    with pytest.raises(TransportError, match="released"):
+        t.write(b"\x02\x01\x00\x00", 100)
+    with pytest.raises(TransportError, match="released"):
+        t.read(64, 100)
+    assert dev.calls == [] and disposed == [dev]
 
 
 def test_open_busy_maps_to_device_busy(monkeypatch, disposed):
