@@ -284,8 +284,8 @@ def split_pd(payload: bytes) -> PdPayload:
         head = bytes(payload[offset:offset + PD_EVENT_HEADER_SIZE])
         if head[0] == PD_EVENT_CONNECTION:
             # Bytes 1 to 4 are the 32-bit uptime, as for messages; byte 5 is the code. A
-            # KM003C on firmware 2.0.0 past 2^24 ms of uptime sent 45 0e ef 63 02 11 with its
-            # status block at 40103694 ms (0x0263ef0e), so the timestamp is not 24 bits.
+            # KM003C on firmware 2.0.0 past 2^24 ms of uptime sent 45 0e ef 63 02 11, which is
+            # 40103694 ms (0x0263ef0e), in a poll whose status block read 40103699 ms.
             ts = struct.unpack_from("<I", head, 1)[0]
             code = head[5]
             kind = ("connect" if code in PD_EVENT_CONNECT
