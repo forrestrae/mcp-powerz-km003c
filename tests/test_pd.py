@@ -125,3 +125,13 @@ def test_epr_request_uses_pdo_copy():
     m = decode_message(hdr.to_bytes(2, "little") + rdo.to_bytes(4, "little") + avs.to_bytes(4, "little"), 0)
     assert m["request"]["output_voltage_v"] == 28.0
     assert m["requested_pdo"]["type"] == "epr_avs"
+
+
+def test_message_header_summary():
+    from km003c_mcp.pd import message_header
+    assert message_header(bytes.fromhex("82102cb18441"), 0) == {
+        "msg": "Request", "msg_id": 0, "power_role": "sink", "data_role": "ufp",
+        "cable_plug": None, "spec_rev": "3.x", "num_objects": 1, "extended": False}
+    cable = message_header(bytes.fromhex("4f51418000ff"), 1)
+    assert (cable["msg"], cable["cable_plug"], cable["power_role"]) == ("Vendor_Defined", True, None)
+    assert message_header(b"\x01", 0)["msg"] is None

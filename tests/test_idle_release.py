@@ -123,7 +123,8 @@ def test_no_release_while_capture_runs():
     assert bench.service.claimed and bench.service.leases() == {"pd capture": 1}
     bench.tools.measure()  # a call during the capture ends its lease; the capture's remains
     time.sleep(0.05)
-    assert bench.service.claimed and bench.tools.pd_capture_read()["running"]
+    assert bench.service.claimed and bench.service.recorder.pd_running
+    assert bench.tools.pd_capture_read()["running"] is True
     assert bench.tools.pd_capture_stop()["stopped"]
     meter = bench.meters[0]
     assert not bench.service.claimed and bench.released(meter)
@@ -149,7 +150,7 @@ def test_no_release_while_stream_runs(monkeypatch):
 
 def test_reading_saved_data_does_not_claim():
     bench = Bench(idle_release_s=0)
-    assert bench.tools.pd_capture_read()["total"] == 0
+    assert bench.tools.pd_capture_read()["kind"] == "Km003cError"  # no capture yet
     assert bench.tools.stream_status()["running"] is False
     assert bench.tools.stream_samples() == {"samples": []}
     assert bench.meters == []
@@ -161,8 +162,9 @@ def test_capture_failure_releases_its_lease():
     meter = bench.meters[0]
     # Make every later reply a timeout: the poller fails, drops the session, and its lease.
     meter.read = lambda size, timeout_ms: (_ for _ in ()).throw(DeviceTimeoutError("gone"))
-    wait_until(lambda: not bench.tools.pd_capture_read()["running"])
+    wait_until(lambda: not bench.service.recorder.pd_running)
     wait_until(lambda: bench.service.leases() == {})
+    assert bench.tools.pd_capture_read()["reason"] == "error"
     assert not bench.service.claimed
     assert "vbus_v" in bench.tools.measure()
     assert len(bench.meters) == 2
@@ -229,7 +231,7 @@ def test_device_release_refused_while_capture_runs():
     bench.tools.pd_capture_start()
     r = bench.tools.device_release()
     assert r["kind"] == "Km003cError" and "pd capture" in r["error"]
-    assert bench.service.claimed and bench.tools.pd_capture_read()["running"]
+    assert bench.service.claimed and bench.service.recorder.pd_running
     bench.tools.pd_capture_stop()
     assert bench.tools.device_release() == {"released": True}
 

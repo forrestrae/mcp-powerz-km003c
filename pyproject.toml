@@ -23,6 +23,7 @@ dev = ["pytest>=8", "ruff>=0.6"]
 
 [project.scripts]
 km003c-mcp = "km003c_mcp.server:main"
+km003c-capture = "km003c_mcp.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/km003c_mcp"]

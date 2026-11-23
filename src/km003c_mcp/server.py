@@ -8,6 +8,7 @@ import functools
 import inspect
 import logging
 import os
+import signal
 import threading
 import time
 from collections import Counter
@@ -18,7 +19,8 @@ from typing import Callable, Literal
 import serial
 from mcp.server.mcpserver import MCPServer
 
-from .protocol import PdEventStream
+from . import capture_read
+from .protocol import PdEventStream, ProtocolError
 from .recorder import Recorder
 from .trigger import (
     TriggerPort, entry_command, fast_charge_command, find_trigger_port, pd_request_command,
@@ -385,7 +387,7 @@ def build_tools(service: Km003cService, enable_trigger: bool | None = None) -> S
                 except serial.SerialException as exc:
                     service.invalidate_trigger()
                     return {"error": str(exc), "kind": type(exc).__name__}
-                except (Km003cError, ValueError, OSError) as exc:
+                except (Km003cError, ProtocolError, ValueError, OSError) as exc:
                     return {"error": str(exc), "kind": type(exc).__name__}
         return wrapper
 
@@ -443,12 +445,12 @@ def build_tools(service: Km003cService, enable_trigger: bool | None = None) -> S
         "pd_capture" and age_ms, the milliseconds since the capture's poll received it.
         timestamp_ms is the meter's own timestamp in both cases.
         """
-        if service.recorder.pd_events(limit=0)["running"]:
+        if service.recorder.pd_running:
             latest = service.recorder.latest_pd_status(wait_s=PD_STATUS_WAIT_S)
             if latest is not None:
                 status, age_s = latest
                 return {**asdict(status), "source": "pd_capture", "age_ms": round(age_s * 1000)}
-            if service.recorder.pd_events(limit=0)["running"]:
+            if service.recorder.pd_running:
                 raise Km003cError("the PD capture has not received a status block yet; retry")
         result = service.device().read_pd()
         if isinstance(result, PdEventStream):
@@ -484,26 +486,103 @@ def build_tools(service: Km003cService, enable_trigger: bool | None = None) -> S
         """Stop the stream and return its statistics."""
         return service.recorder.stop_stream().to_dict()
 
-    @meter
-    def pd_capture_start() -> dict:
-        """Start capturing USB PD traffic (messages, attach/detach) in the background.
+    def read_capture(path, *args, extra: dict | None = None) -> dict:
+        """Read a capture file; when it is this session's capture, say whether it still runs.
 
-        Enables the meter's PD monitor first. pd_monitor reports the outcome: accepted, or
-        "already enabled or refused" when the meter answered Reject, which does not stop capture.
+        The added fields count toward the summary's size bound.
         """
-        monitor = service.recorder.start_pd()
-        return {"started": True, "pd_monitor": monitor.to_dict()}
+        extra = dict(extra or {})
+        state = service.recorder.pd_capture_state()
+        if state["path"] is not None and state["path"] == str(capture_read.resolve_path(path)):
+            extra["running"] = state["running"]
+        return capture_read.read(path, *args, extra=extra)
+
+    def capture_summary(path, extra: dict | None = None) -> dict:
+        return read_capture(path, "summary", extra=extra)
+
+    def current_capture() -> str:
+        path = service.recorder.capture_path
+        if path is None:
+            raise Km003cError("no PD capture in this session; pass path to read a saved file")
+        return str(path)
+
+    @meter
+    def pd_capture_start(path: str | None = None, label: str | None = None,
+                         provenance: dict | None = None, stop_after_messages: int | None = None,
+                         stop_on: Literal["none", "contract", "identity"] = "none",
+                         settle_ms: int = 0, timeout_s: float = 60,
+                         status_interval_ms: int = 100) -> dict:
+        """Start capturing USB PD traffic to a capture file (JSON Lines) in the background.
+
+        The file is path, or a new file in $KM003C_CAPTURE_DIR, else ./captures; the result
+        gives its absolute path. label and provenance (any JSON object) go in its header.
+        The capture stops on its own when stop_on is met: contract (PS_RDY after an Accept
+        of a Request) or identity (a Discover Identity ACK on SOP); or after
+        stop_after_messages non-GoodCRC messages; then keeps capturing settle_ms more
+        (meter time). It always stops after timeout_s. A status record (VBUS, IBUS, CC) is
+        written every status_interval_ms and with every poll that carries events.
+
+        Start the capture before the stimulus: the meter records only what happens after
+        monitoring is enabled. Then use pd_capture_wait, pd_capture_mark, pd_capture_stop
+        and pd_capture_read. pd_monitor reports the enable: accepted, or "already enabled
+        or refused" when the meter answered Reject, which does not stop capture.
+        """
+        monitor = service.recorder.start_pd(
+            path, label, provenance, stop_on=stop_on, stop_after_messages=stop_after_messages,
+            settle_ms=settle_ms, timeout_s=timeout_s, status_interval_ms=status_interval_ms)
+        return {"started": True, "path": str(service.recorder.capture_path),
+                "pd_monitor": monitor.to_dict()}
 
     @safe
-    def pd_capture_read(since: int = 0, limit: int = 100, decode: bool = True) -> dict:
-        """Page through captured PD events from index `since`; `next` is the next index to ask."""
-        return service.recorder.pd_events(since, limit, decode)
+    def pd_capture_wait(timeout_s: float = 60) -> dict:
+        """Wait up to timeout_s for the running capture to stop, then return its summary.
+
+        running is True in the result when the capture is still going; reason says why it
+        stopped. Waiting does not stop the capture. timeout_s is clamped to 0 to 86400.
+        """
+        service.recorder.wait_pd(timeout_s)
+        return capture_summary(current_capture())
+
+    @safe
+    def pd_capture_mark(text: str) -> dict:
+        """Write an annotation into the running capture, such as "stimulus GSrC sent"."""
+        record = service.recorder.mark_pd(text)
+        return {"marked": True, "path": current_capture(), "t_host": record["t_host"]}
 
     @meter
     def pd_capture_stop() -> dict:
-        """Stop the PD capture; captured events stay readable until the next start."""
-        service.recorder.stop_pd()
-        return {"stopped": True, "total": service.recorder.pd_events(limit=0)["total"]}
+        """Stop the running PD capture and return its summary (stopped is False when none ran;
+        the summary is then the last capture's)."""
+        stopped = service.recorder.stop_pd() is not None
+        return capture_summary(current_capture(), extra={"stopped": stopped})
+
+    @safe
+    def pd_capture_read(path: str | None = None,
+                        mode: Literal["summary", "messages", "facts", "full"] = "summary",
+                        sop: str | None = None, types: list[str] | None = None,
+                        since: int | None = None, after: int | None = None,
+                        limit: int | None = None, include_goodcrc: bool = False) -> dict:
+        """Read a capture file; never touches the meter. Without path: the running or last
+        capture of this session.
+
+        mode summary (default): about 2 KB at most; one line per non-GoodCRC message such as
+        "t=84002 SOP Request pos 4, 3.0 A [8210 2cb18441]", connection events and marks,
+        counts, VBUS first/last/min/max (mV), the final contract, and warnings from the
+        sanity rules (no negotiation, PD monitoring inactive, capture started late).
+        messages: the same lines, filtered and paged (limit default 50): pass a page's
+        next_after as after for the next page; next_after is absent on the last page. facts: Source_Capabilities PDOs, Request RDOs with their
+        object position, Accept and PS_RDY times, and Discover Identity ACKs grouped by SOP
+        and sender, each value beside its hex; at most about 8 KB, with omitted counting what
+        a long capture left out. full: complete decodes (limit default 20).
+        Filters: sop ("SOP", "SOP'", "SOP''"), types (message type or VDM command names,
+        such as Request or Discover_Identity; also connect, disconnect, mark, error), since
+        (keeps entries at or after that meter time in ms; marks without a time drop out),
+        include_goodcrc. after is a line number in the file (exclusive) and is how pages
+        advance; since only narrows the window. Times are the meter's uptime in ms. running
+        appears when the file is this session's capture.
+        """
+        return read_capture(path or current_capture(), mode, sop, types, since, limit,
+                            include_goodcrc, after)
 
     @safe
     def device_release() -> dict:
@@ -569,7 +648,8 @@ def build_tools(service: Km003cService, enable_trigger: bool | None = None) -> S
 
     return SimpleNamespace(**{fn.__name__: fn for fn in (
         device_info, measure, pd_status, stream_start, stream_status, stream_samples,
-        stream_stop, pd_capture_start, pd_capture_read, pd_capture_stop, device_release,
+        stream_stop, pd_capture_start, pd_capture_wait, pd_capture_mark, pd_capture_read,
+        pd_capture_stop, device_release,
         trigger_detect, trigger_enter, trigger_pd_source_caps, trigger_pd_request,
         trigger_fast_charge, trigger_reset, trigger_close, trigger_raw)
         if enable_trigger or fn.__name__ not in TRIGGER_TOOLS})
@@ -594,6 +674,35 @@ tools = build_tools(service)
 mcp = build_server(tools)
 
 
+# After SIGTERM the server exits this long after starting its cleanup, even if a step hangs.
+SIGTERM_EXIT_DEADLINE_S = 10.0
+
+
+def install_sigterm_handler(service: Km003cService, exit_fn: Callable[[int], None] = os._exit,
+                            deadline_s: float = SIGTERM_EXIT_DEADLINE_S) -> None:
+    """On SIGTERM, stop a running capture and stream, release the meter, and exit 0.
+
+    A running capture gets its footer with reason ``manual``. The cleanup runs on its own
+    thread, because the signal can arrive while the main thread holds a lock the cleanup
+    needs; the process exits when it is done, or after ``deadline_s`` at the latest.
+    """
+    def stop_and_exit() -> None:
+        try:
+            service.shutdown()
+        finally:
+            exit_fn(0)
+
+    def on_sigterm(signum, frame) -> None:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        threading.Thread(target=stop_and_exit, name="km003c-sigterm", daemon=True).start()
+        watchdog = threading.Timer(deadline_s, exit_fn, args=(0,))
+        watchdog.daemon = True
+        watchdog.start()
+
+    signal.signal(signal.SIGTERM, on_sigterm)
+
+
 def main() -> None:
     atexit.register(service.shutdown)
+    install_sigterm_handler(service)
     mcp.run()
