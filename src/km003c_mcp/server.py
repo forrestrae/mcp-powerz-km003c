@@ -545,8 +545,8 @@ def build_tools(service: Km003cService, enable_trigger: bool | None = None) -> S
     def pd_capture_read(path: str | None = None,
                         mode: Literal["summary", "messages", "facts", "full"] = "summary",
                         sop: str | None = None, types: list[str] | None = None,
-                        since: int | None = None, limit: int | None = None,
-                        include_goodcrc: bool = False) -> dict:
+                        since: int | None = None, after: int | None = None,
+                        limit: int | None = None, include_goodcrc: bool = False) -> dict:
         """Read a capture file; never touches the meter. Without path: the running or last
         capture of this session.
 
@@ -554,17 +554,19 @@ def build_tools(service: Km003cService, enable_trigger: bool | None = None) -> S
         "t=84002 SOP Request pos 4, 3.0 A [8210 2cb18441]", connection events and marks,
         counts, VBUS first/last/min/max (mV), the final contract, and warnings from the
         sanity rules (no negotiation, PD monitoring inactive, capture started late).
-        messages: the same lines, filtered and paged (limit default 50); pass next_since as
-        since for the next page. facts: Source_Capabilities PDOs, Request RDOs with their
+        messages: the same lines, filtered and paged (limit default 50): pass a page's
+        next_after as after for the next page; next_after is absent on the last page. facts: Source_Capabilities PDOs, Request RDOs with their
         object position, Accept and PS_RDY times, and Discover Identity ACKs grouped by SOP
         and sender, each value beside its hex. full: complete decodes (limit default 20).
         Filters: sop ("SOP", "SOP'", "SOP''"), types (message type or VDM command names,
         such as Request or Discover_Identity; also connect, disconnect, mark, error), since
-        (meter ms), include_goodcrc. Times are the meter's uptime in ms. running appears
-        when the file is this session's capture.
+        (keeps entries at or after that meter time in ms; marks without a time drop out),
+        include_goodcrc. after is a line number in the file (exclusive) and is how pages
+        advance; since only narrows the window. Times are the meter's uptime in ms. running
+        appears when the file is this session's capture.
         """
         return read_capture(path or current_capture(), mode, sop, types, since, limit,
-                            include_goodcrc)
+                            include_goodcrc, after)
 
     @safe
     def device_release() -> dict:

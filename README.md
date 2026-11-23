@@ -147,7 +147,7 @@ row end it with reason `error`.
 
 ### Reading a capture
 
-`pd_capture_read(path?, mode="summary", sop?, types?, since?, limit?, include_goodcrc=False)`
+`pd_capture_read(path?, mode="summary", sop?, types?, since?, after?, limit?, include_goodcrc=False)`
 reads a file without touching the meter. Without `path` it reads this session's running
 or last capture; a bare file name is also looked up in the capture directory. Every
 decoded value sits beside the wire hex it came from.
@@ -155,13 +155,20 @@ decoded value sits beside the wire hex it came from.
 | Mode | Returns |
 |---|---|
 | `summary` (default) | At most about 2 KB: one line per non-GoodCRC message, such as `t=14637562 SOP Request pos 4, 3.0 A [8210 2cb18441]`, plus connection events, marks, and errors; counts by message type; VBUS first, last, min, and max; the final contract; and warnings. When the lines do not fit, lines from the middle are dropped, `truncated` is true, and a marker line names the omitted range |
-| `messages` | The same lines, filtered and paged; `limit` defaults to 50. Pass `next_since` as `since` for the next page |
+| `messages` | The same lines, filtered and paged; `limit` defaults to 50. Pass a page's `next_after` as `after` for the next page; `next_after` is absent on the last page |
 | `facts` | What a register cross-check needs: Source_Capabilities PDOs, each Request RDO with its object position, the PDO it names, and its Accept and PS_RDY times, the final contract, and Discover Identity ACKs grouped by SOP and by sender (power and data role on SOP, cable or port on SOP'), each VDO beside its decode |
-| `full` | Complete decodes of the filtered messages; `limit` defaults to 20 |
+| `full` | Complete decodes of the filtered messages, each with its `line`; `limit` defaults to 20, and paging works as in `messages` |
 
 Filters: `sop` (`SOP`, `SOP'`, `SOP''`), `types` (message type names, VDM command names
-such as `Discover_Identity`, and `connect`, `disconnect`, `mark`, `error`), `since` (meter
-time in ms), and `include_goodcrc`.
+such as `Discover_Identity`, and `connect`, `disconnect`, `mark`, `error`), `since` (keeps
+entries at or after that meter time in ms; a mark or error without an estimated time drops
+out), and `include_goodcrc`.
+
+Pages advance by position, not by time: `after` is a line number in the file, exclusive,
+and each page returns the `next_after` to pass next. Marks and errors carry times estimated
+from the host clock, which need not be in order with the meter's, and several messages can
+share a millisecond, so paging by `since` would repeat or skip entries. Use `since` to pick
+a window and `after` to walk through it.
 
 The summary and facts warnings implement the checks to make before comparing a capture
 with anything else:

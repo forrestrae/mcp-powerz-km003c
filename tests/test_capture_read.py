@@ -184,19 +184,36 @@ def test_messages_filters():
         cr.read(GOLDEN, "messages", sop="SOP'''")
 
 
-def test_messages_paging_keeps_equal_times_together():
-    first = cr.read(GOLDEN, "messages", limit=4, include_goodcrc=True)
-    # Entry 4 (t=14637552) is followed by its GoodCRC at the same time; both stay together.
-    assert first["count"] == 5 and first["total"] == 19
-    assert first["next_since"] == 14637555
-    rest = cr.read(GOLDEN, "messages", since=first["next_since"], limit=500,
-                   include_goodcrc=True)
-    assert first["count"] + rest["count"] == 19 and rest["next_since"] is None
+def _walk(path, mode="messages", **kwargs):
+    """Every page of a read, following next_after."""
+    pages, after = [], None
+    while True:
+        page = cr.read(path, mode, after=after, **kwargs)
+        pages.append(page)
+        if "next_after" not in page:
+            return pages
+        assert page["count"] > 0
+        after = page["next_after"]
+
+
+def test_messages_paging_walks_the_golden_file_once():
+    pages = _walk(GOLDEN, limit=4, include_goodcrc=True)
+    lines = [line for page in pages for line in page["lines"]]
+    assert len(lines) == 19 and len(set(lines)) == 19 and len(pages) == 5
+    assert all(page["total"] == 19 for page in pages)
+
+
+def test_after_must_be_a_line_number():
+    with pytest.raises(ValueError, match="after must be a line number"):
+        cr.read(GOLDEN, "messages", after="14637555")
 
 
 def test_full_mode_default_limit_and_hex_beside_decode():
     out = cr.read(GOLDEN, "full", include_goodcrc=True)
-    assert out["count"] == 16 and out["next_since"] is None
+    assert out["count"] == 16 and "next_after" not in out
+    first_pd = next(n for n, line in enumerate(GOLDEN.read_text().splitlines(), 1)
+                    if '"type":"pd"' in line)
+    assert out["messages"][0]["line"] == first_pd
     out = cr.read(GOLDEN, "full", types=["Request"])
     (msg,) = out["messages"]
     assert msg["wire"] == "82102cb18441" and msg["decoded"]["objects"] == ["4184b12c"]
@@ -355,3 +372,40 @@ def test_cli_exits_2_for_an_unreadable_file(tmp_path, capsys):
     assert main(["summarize", str(tmp_path / "x.jsonl")]) == 2
     assert main(["facts", str(tmp_path)]) == 2
     assert "cannot read" in capsys.readouterr().err
+
+
+# --- paging by position ---------------------------------------------------------------------
+
+# Marks carry host-estimated times that can run ahead of the meter's message times.
+OUT_OF_ORDER = [
+    HEADER,
+    {"type": "status", "t_host": 100.0, "t_meter_ms": 980, "vbus_mv": 5000},
+    _pd(0, 990, "a303"),
+    {"type": "mark", "t_host": 100.07, "text": "stimulus"},  # estimated t=1050
+    _pd(1, 1020, "a605"),
+    _pd(2, 1040, "a303"),
+    _pd(3, 1055, "a605"),
+]
+
+
+@pytest.mark.parametrize("limit", [1, 2])
+def test_paging_by_position_neither_repeats_nor_skips(tmp_path, limit):
+    path = _write(tmp_path, OUT_OF_ORDER)
+    pages = _walk(path, limit=limit)
+    lines = [line for page in pages for line in page["lines"]]
+    assert [line.split(" ")[0] for line in lines] == ["t=990", "t~1050", "t=1020", "t=1040",
+                                                      "t=1055"]
+    assert all("next_after" in page for page in pages[:-1])
+    assert "next_after" not in pages[-1]
+
+
+def test_paging_includes_a_mark_without_a_time(tmp_path):
+    # No status record: the mark's time cannot be estimated.
+    path = _write(tmp_path, [HEADER, _pd(0, 990, "a303"),
+                             {"type": "mark", "t_host": 1.0, "text": "no time"},
+                             _pd(1, 1020, "a605")])
+    lines = [line for page in _walk(path, limit=1) for line in page["lines"]]
+    assert lines[1] == "t~? mark: no time" and len(lines) == 3
+    # since is a window: it keeps timed entries at or after it and drops the untimed mark.
+    assert [line.split(" ")[0] for line in cr.read(path, "messages", since=1000)["lines"]] == [
+        "t=1020"]
