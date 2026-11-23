@@ -162,6 +162,10 @@ class PyUsbTransport:
             dev.set_configuration()
             usb.util.claim_interface(dev, INTERFACE)
         except (usb.core.USBError, NotImplementedError) as exc:
+            # Close the handle the failed attempt opened. While it stays open, for example
+            # because the raised error's traceback keeps ``dev`` alive, macOS refuses this
+            # process's next claim with errno 19 even after the other holder has exited.
+            usb.util.dispose_resources(dev)
             raise DeviceBusyError(
                 f"cannot claim the KM003C vendor interface ({exc}); "
                 "close the POWER-Z PC software or any other program using the meter") from exc

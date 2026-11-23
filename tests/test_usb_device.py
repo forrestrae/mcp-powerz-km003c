@@ -192,11 +192,21 @@ class StubUsb:
             raise self.fail
 
 
-def test_open_busy_maps_to_device_busy(monkeypatch):
+@pytest.fixture
+def disposed(monkeypatch):
+    """Records the devices whose handles open() closes."""
+    devices = []
+    monkeypatch.setattr(usb.util, "dispose_resources", devices.append)
+    return devices
+
+
+def test_open_busy_maps_to_device_busy(monkeypatch, disposed):
     err = usb.core.USBError("Access denied (insufficient permissions)", errno=13)
-    monkeypatch.setattr(ud, "_find_devices", lambda: [StubUsb("A", fail=err)])
+    stub = StubUsb("A", fail=err)
+    monkeypatch.setattr(ud, "_find_devices", lambda: [stub])
     with pytest.raises(DeviceBusyError, match="POWER-Z PC software"):
         PyUsbTransport.open()
+    assert disposed == [stub]  # the failed attempt's handle is closed
 
 
 def test_open_no_device(monkeypatch):
