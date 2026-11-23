@@ -60,6 +60,9 @@ METER_MEMORY = {
     0x40010450: bytes.fromhex("3037314b42500dff110affff"),
 }
 PD_STATUS_STEP_MS = 15
+# A pd_payloads entry that makes MeterFake send a PutData whose framing is broken: its
+# extended header claims more bytes than follow, so parse_putdata raises ProtocolError.
+CORRUPT_PUTDATA = b"\xff"
 
 
 class MeterFake:
@@ -72,8 +75,9 @@ class MeterFake:
     runs when the session is released.
 
     ``pd_payloads`` are PdPacket payloads returned in order, one per GetData that asks for
-    the PD attribute. Once they run out, each poll returns the last status block with its
-    uptime advanced by 15 ms, as an idle meter does.
+    the PD attribute; :data:`CORRUPT_PUTDATA` sends a reply with broken framing instead. Once
+    they run out, each poll returns the last status block with its uptime advanced by 15 ms,
+    as an idle meter does.
     """
 
     def __init__(self, serial_number="TEST", hold_disconnect: threading.Event | None = None,
@@ -115,6 +119,8 @@ class MeterFake:
                 self.pd_payloads or self._last_status):
             payload = self._next_pd_payload()
             ext = struct.pack("<I", p.ATT_PD | (len(payload) << 22))
+            if payload == CORRUPT_PUTDATA:
+                ext, payload = struct.pack("<I", p.ATT_PD | (200 << 22)), bytes(12)
             reply = bytes([p.CMD_PUT_DATA, tid, 0, 0]) + ext + payload
         elif cmd == p.CMD_MEMORY_READ:
             from km003c_mcp.crypto import KEY_MEMORY, aes_ecb

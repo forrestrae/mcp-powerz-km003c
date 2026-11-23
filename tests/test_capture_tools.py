@@ -11,6 +11,9 @@ import time
 import pytest
 
 from capture_bench import GOLDEN, S3, CaptureBench, normalize, records, s3_until
+from fakes import CORRUPT_PUTDATA, FakeTransport, live_adc_with_tid
+from km003c_mcp.protocol import ATT_ADC, ATT_PD, CMD_PUT_DATA
+from km003c_mcp.recorder import MAX_CONSECUTIVE_PROTOCOL_ERRORS
 from km003c_mcp.server import Km003cService, build_tools
 
 
@@ -158,6 +161,25 @@ def test_corrupt_payload_mid_capture_is_recorded_and_capture_continues(bench_fac
     assert [r["msg"] for r in non_goodcrc(recs)][-3:] == ["Request", "Accept", "PS_RDY"]
 
 
+def test_corrupt_putdata_is_recorded_and_capture_continues(bench_factory):
+    bench = bench_factory([S3[0], CORRUPT_PUTDATA, *S3[1:]])
+    path = bench.tools.pd_capture_start(stop_on="contract")["path"]
+    assert bench.tools.pd_capture_wait(timeout_s=10)["reason"] == "contract"
+    errors = [r for r in records(path) if r["type"] == "error"]
+    assert len(errors) == 1 and "logical packet needs 200 bytes" in errors[0]["message"]
+
+
+def test_repeated_protocol_errors_end_the_capture_with_a_footer(bench_factory):
+    bench = bench_factory([S3[0]] + [CORRUPT_PUTDATA] * MAX_CONSECUTIVE_PROTOCOL_ERRORS)
+    path = bench.tools.pd_capture_start()["path"]
+    summary = bench.tools.pd_capture_wait(timeout_s=5)
+    assert summary["reason"] == "error"
+    recs = records(path)
+    # One error record per failed poll, then the one that ended the capture.
+    assert recs[-1]["type"] == "footer" and recs[-1]["errors"] == MAX_CONSECUTIVE_PROTOCOL_ERRORS + 1
+    assert "polls in a row failed to parse" in recs[-2]["message"]
+
+
 def test_whole_negotiation_in_one_poll(bench_factory):
     from capture_bench import S4
     bench = bench_factory(S4)
@@ -198,6 +220,36 @@ def test_reading_a_file_never_claims_the_meter(tmp_path):
         out = tools.pd_capture_read(path=str(GOLDEN), mode=mode)
         assert "error" not in out and out["path"] == str(GOLDEN.resolve())
     assert service.leases() == {} and not service.claimed
+
+
+# --- ProtocolError from the meter becomes an error result -----------------------------------
+
+def _putdata(tid, attribute, payload):
+    import struct
+    return bytes([CMD_PUT_DATA, tid, 0, 0]) + struct.pack("<I", attribute | len(payload) << 22) \
+        + payload
+
+
+def _tools(script):
+    opened = [bytes.fromhex("05010000"), bytes.fromhex("06020000")]
+    service = Km003cService(transport_factory=lambda: FakeTransport(opened + script),
+                            idle_release_s=None)
+    return build_tools(service, enable_trigger=False)
+
+
+def test_measure_returns_protocol_error_result():
+    tools = _tools([_putdata(3, ATT_ADC, bytes(10))])
+    assert tools.measure()["kind"] == "ProtocolError"
+
+
+def test_pd_status_returns_protocol_error_result():
+    tools = _tools([_putdata(3, ATT_PD, bytes(5))])
+    out = tools.pd_status()
+    assert out["kind"] == "ProtocolError" and "too short" in out["error"]
+    # The session survives: the next call works.
+    tools2 = _tools([_putdata(3, ATT_PD, bytes(5)), live_adc_with_tid(4)])
+    tools2.pd_status()
+    assert "vbus_v" in tools2.measure()
 
 
 def test_capture_survives_poll_timing(bench_factory):

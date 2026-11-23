@@ -19,7 +19,7 @@ import serial
 from mcp.server.mcpserver import MCPServer
 
 from . import capture_read
-from .protocol import PdEventStream
+from .protocol import PdEventStream, ProtocolError
 from .recorder import Recorder
 from .trigger import (
     TriggerPort, entry_command, fast_charge_command, find_trigger_port, pd_request_command,
@@ -383,7 +383,7 @@ def build_tools(service: Km003cService, enable_trigger: bool | None = None) -> S
                 except serial.SerialException as exc:
                     service.invalidate_trigger()
                     return {"error": str(exc), "kind": type(exc).__name__}
-                except (Km003cError, ValueError, OSError) as exc:
+                except (Km003cError, ProtocolError, ValueError, OSError) as exc:
                     return {"error": str(exc), "kind": type(exc).__name__}
         return wrapper
 

@@ -42,6 +42,9 @@ DEFAULT_PD_POLL_MS = 50
 # overflow, and the meter gains nothing from polls under 1 ms apart.
 MIN_PD_POLL_MS = 1
 MAX_PD_POLL_MS = 10_000
+# A reply that fails to parse loses that poll's data but leaves the link working, so the
+# poller records it and goes on; this many in a row end the stream and the capture.
+MAX_CONSECUTIVE_PROTOCOL_ERRORS = 10
 
 
 @dataclass
@@ -224,6 +227,7 @@ class Recorder:
 
     def _run(self) -> None:
         me = threading.current_thread()
+        protocol_errors = 0
         while True:
             with self._state:
                 if self._thread is not me:
@@ -238,17 +242,34 @@ class Recorder:
                     self._thread = None
                     return
             try:
-                packets = device.get_data(mask)
+                bad: ProtocolError | None = None
+                try:
+                    packets = device.get_data(mask)
+                except ProtocolError as exc:
+                    packets, bad = [], exc
                 stop_reason = None
                 with self._state:
                     pd_gen = self._pd_gen
                     for packet in packets:
                         if packet.attribute == ATT_ADCQUEUE and self._stream:
-                            self._stream.feed(parse_adcqueue(packet.payload, self._stream.rate_index))
+                            try:
+                                samples = parse_adcqueue(packet.payload, self._stream.rate_index)
+                            except ProtocolError as exc:
+                                bad = exc
+                                continue
+                            self._stream.feed(samples)
                         elif packet.attribute == ATT_PD and self._pd_active:
                             stop_reason = self._pd.ingest(packet.payload) or stop_reason
                     if self._pd_active:
+                        if bad is not None:
+                            self._pd.error("ProtocolError", str(bad))
                         stop_reason = stop_reason or self._pd.check_timeout()
+                protocol_errors = protocol_errors + 1 if bad is not None else 0
+                if protocol_errors >= MAX_CONSECUTIVE_PROTOCOL_ERRORS:
+                    raise ProtocolError(f"{protocol_errors} polls in a row failed to parse; "
+                                        f"last: {bad}")
+                if bad is not None:
+                    log.warning("dropping a poll that failed to parse: %s", bad)
                 if stop_reason is not None:
                     self._end_pd(stop_reason, pd_gen)
                 time.sleep(poll)
