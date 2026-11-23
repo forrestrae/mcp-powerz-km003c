@@ -38,6 +38,37 @@ EXTENDED_TYPES = {
 _REQUEST_TYPES = {"Request", "EPR_Request"}
 
 
+def message_header(wire: bytes, sop: int) -> dict:
+    """Summarize a PD message header: type name, MessageID, roles, revision, object count.
+
+    ``power_role`` and ``data_role`` apply to SOP; ``cable_plug`` to SOP' and SOP''. The others
+    are None. ``msg`` is None when the wire is shorter than the 2-byte header.
+    """
+    out = {"msg": None, "msg_id": None, "power_role": None, "data_role": None,
+           "cable_plug": None, "spec_rev": None, "num_objects": None, "extended": None}
+    if len(wire) < 2:
+        return out
+    header = int.from_bytes(wire[:2], "little")
+    msg_type = _bits(header, 4, 0)
+    num_objects = _bits(header, 14, 12)
+    extended = bool(header >> 15)
+    if extended:
+        name = EXTENDED_TYPES.get(msg_type)
+    elif num_objects == 0:
+        name = CONTROL_TYPES.get(msg_type)
+    else:
+        name = DATA_TYPES.get(msg_type)
+    out.update({"msg": name or f"Reserved_{msg_type}", "msg_id": _bits(header, 11, 9),
+                "spec_rev": SPEC_REVISIONS.get(_bits(header, 7, 6), "reserved"),
+                "num_objects": num_objects, "extended": extended})
+    if sop == 0:
+        out["power_role"] = "source" if header & (1 << 8) else "sink"
+        out["data_role"] = "dfp" if header & (1 << 5) else "ufp"
+    elif sop in (1, 2):
+        out["cable_plug"] = bool(header & (1 << 8))
+    return out
+
+
 def decode_message(wire: bytes, sop: int, source_pdos: list[dict] | None = None) -> dict:
     if len(wire) < 2:
         return {"error": "PD message shorter than its 2-byte header", "raw": wire.hex()}
