@@ -103,3 +103,68 @@ def test_open_multiple_devices_requires_serial(monkeypatch):
     with pytest.raises(Km003cError, match="A.*B"):
         PyUsbTransport.open()
     assert PyUsbTransport.open("B").serial_number == "B"
+
+
+class BackendCalls:
+    """Records which libusb lookups _backend() makes; each returns its scripted result."""
+
+    def __init__(self, monkeypatch, bundled=None, system=None, explicit=None):
+        import libusb_package
+        import usb.backend.libusb1
+
+        self.calls = []
+
+        def get_backend(find_library=None):
+            if find_library is None:
+                self.calls.append("system")
+                return system
+            self.calls.append(("explicit", find_library("usb-1.0")))
+            return explicit
+
+        def get_bundled():
+            self.calls.append("bundled")
+            return bundled
+
+        monkeypatch.setattr(usb.backend.libusb1, "get_backend", get_backend)
+        monkeypatch.setattr(libusb_package, "get_libusb1_backend", get_bundled)
+        monkeypatch.delenv("KM003C_LIBUSB", raising=False)
+        monkeypatch.delenv("KM003C_LIBUSB_DLL", raising=False)
+
+
+def test_backend_prefers_explicit_path(monkeypatch):
+    calls = BackendCalls(monkeypatch, bundled="B", explicit="E")
+    monkeypatch.setenv("KM003C_LIBUSB", "/opt/lib/libusb-1.0.dylib")
+    assert ud._backend() == "E"
+    assert calls.calls == [("explicit", "/opt/lib/libusb-1.0.dylib")]
+
+
+def test_backend_accepts_dll_alias(monkeypatch):
+    calls = BackendCalls(monkeypatch, explicit="E")
+    monkeypatch.setenv("KM003C_LIBUSB_DLL", r"C:\libusb-1.0.dll")
+    assert ud._backend() == "E"
+    assert calls.calls == [("explicit", r"C:\libusb-1.0.dll")]
+
+
+def test_backend_explicit_path_that_fails_raises(monkeypatch):
+    BackendCalls(monkeypatch, bundled="B", system="S", explicit=None)
+    monkeypatch.setenv("KM003C_LIBUSB", "/missing/libusb-1.0.dylib")
+    with pytest.raises(Km003cError, match="/missing/libusb-1.0.dylib"):
+        ud._backend()
+
+
+def test_backend_uses_bundled_library(monkeypatch):
+    calls = BackendCalls(monkeypatch, bundled="B", system="S")
+    assert ud._backend() == "B"
+    assert calls.calls == ["bundled"]
+
+
+def test_backend_falls_back_to_system_library(monkeypatch):
+    calls = BackendCalls(monkeypatch, bundled=None, system="S")
+    assert ud._backend() == "S"
+    assert calls.calls == ["bundled", "system"]
+
+
+def test_backend_reports_missing_libusb(monkeypatch):
+    BackendCalls(monkeypatch)
+    with pytest.raises(Km003cError, match="KM003C_LIBUSB"):
+        ud._backend()

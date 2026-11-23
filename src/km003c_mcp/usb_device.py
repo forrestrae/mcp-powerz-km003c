@@ -66,14 +66,34 @@ class UsbTransport(Protocol):
 
 
 def _backend():
+    """Load libusb-1.0: an explicit path, then the bundled library, then the system's.
+
+    ``KM003C_LIBUSB`` (or its older name ``KM003C_LIBUSB_DLL``) names the library file.
+    Without it, the copy bundled by ``libusb-package`` is tried first, then pyusb's normal
+    search, which also finds Homebrew's ``/opt/homebrew/lib/libusb-1.0.dylib`` on Apple
+    Silicon and a distribution's ``libusb-1.0.so`` on Linux.
+    """
     import usb.backend.libusb1
 
-    dll = os.environ.get("KM003C_LIBUSB_DLL")
-    if dll:
-        return usb.backend.libusb1.get_backend(find_library=lambda _name: dll)
-    import libusb_package
+    path = os.environ.get("KM003C_LIBUSB") or os.environ.get("KM003C_LIBUSB_DLL")
+    if path:
+        backend = usb.backend.libusb1.get_backend(find_library=lambda _name: path)
+        if backend is None:
+            raise Km003cError(f"cannot load libusb-1.0 from {path!r} (KM003C_LIBUSB)")
+        return backend
+    try:
+        import libusb_package
 
-    return libusb_package.get_libusb1_backend()
+        backend = libusb_package.get_libusb1_backend()
+    except ImportError:
+        backend = None
+    if backend is None:
+        backend = usb.backend.libusb1.get_backend()
+    if backend is None:
+        raise Km003cError(
+            "no libusb-1.0 library found; install libusb (for example `brew install libusb`) "
+            "or set KM003C_LIBUSB to the library file")
+    return backend
 
 
 def _find_devices() -> list:
