@@ -256,3 +256,26 @@ def test_idle_release_from_env(monkeypatch, value, expected):
     monkeypatch.setenv("KM003C_IDLE_RELEASE_S", value)
     assert idle_release_from_env() == expected
 
+
+
+def test_pd_status_during_capture_returns_the_capture_block():
+    import struct
+    block = struct.pack("<IHhHH", 123456, 5000, 1500, 1650, 0)
+    bench = Bench(idle_release_s=None, pd_status=block)
+    assert bench.tools.pd_capture_start()["started"]
+    r = bench.tools.pd_status()
+    assert r["source"] == "pd_capture" and r["timestamp_ms"] == 123456
+    assert r["vbus_v"] == pytest.approx(5.0) and r["ibus_a"] == pytest.approx(1.5)
+    assert 0 <= r["age_ms"] < 1000
+    bench.tools.pd_capture_stop()
+    r = bench.tools.pd_status()  # without a capture it reads the meter
+    assert "source" not in r and r["timestamp_ms"] == 123456
+
+
+def test_pd_status_during_capture_without_a_block_says_so(monkeypatch):
+    monkeypatch.setattr(srv, "PD_STATUS_WAIT_S", 0.05)
+    bench = Bench(idle_release_s=None)  # the fake meter sends no PD data
+    bench.tools.pd_capture_start()
+    r = bench.tools.pd_status()
+    assert r["kind"] == "Km003cError" and "not received a status block" in r["error"]
+    bench.tools.pd_capture_stop()

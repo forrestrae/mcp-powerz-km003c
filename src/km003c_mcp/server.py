@@ -60,6 +60,8 @@ def idle_release_from_env() -> float | None:
     return seconds
 
 
+# pd_status during a capture waits this long for the capture's first status block.
+PD_STATUS_WAIT_S = 1.0
 # Unset KM003C_ENABLE_TRIGGER: True registers the trigger tools.
 DEFAULT_ENABLE_TRIGGER = True
 TRIGGER_TOOLS = ("trigger_detect", "trigger_enter", "trigger_pd_source_caps",
@@ -435,10 +437,18 @@ def build_tools(service: Km003cService, enable_trigger: bool | None = None) -> S
     def pd_status() -> dict:
         """Read the PD-side status snapshot (timestamp, VBUS, IBUS, CC1, CC2).
 
-        Not available while a PD capture runs, because reading would consume captured events.
+        While a PD capture runs, reading the meter would consume captured events, so this
+        returns the latest status block the capture received instead, with source
+        "pd_capture" and age_ms, the milliseconds since the capture's poll received it.
+        timestamp_ms is the meter's own timestamp in both cases.
         """
         if service.recorder.pd_events(limit=0)["running"]:
-            raise Km003cError("a PD capture is running; use pd_capture_read instead")
+            latest = service.recorder.latest_pd_status(wait_s=PD_STATUS_WAIT_S)
+            if latest is not None:
+                status, age_s = latest
+                return {**asdict(status), "source": "pd_capture", "age_ms": round(age_s * 1000)}
+            if service.recorder.pd_events(limit=0)["running"]:
+                raise Km003cError("the PD capture has not received a status block yet; retry")
         result = service.device().read_pd()
         if isinstance(result, PdEventStream):
             out = asdict(result.preamble)
