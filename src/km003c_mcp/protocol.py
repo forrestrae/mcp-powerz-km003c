@@ -212,7 +212,7 @@ def parse_adcqueue(payload: bytes, rate_index: int) -> list[AdcQueueSample]:
 PD_STATUS_SIZE = 12
 PD_EVENT_HEADER_SIZE = 6
 PD_EVENT_CONNECTION = 0x45
-# Firmware 1.8.x uses 0x11/0x12 for the same attach/detach records.
+# Firmware 1.8.x and 2.0.0 use 0x11/0x12 for the same attach/detach records.
 PD_EVENT_CONNECT = (0x21, 0x11)
 PD_EVENT_DISCONNECT = (0x22, 0x12)
 
@@ -228,10 +228,20 @@ class PdStatus:
 
 @dataclass(frozen=True)
 class PdEvent:
+    """One event record of a PdPacket payload.
+
+    ``kind`` is ``connect``, ``disconnect``, ``connection`` (an unknown connection code), or
+    ``message``. ``code`` is the connection-event code byte, None for messages. ``raw`` is the
+    record as received: the 6-byte event header followed by the wire bytes. A connection
+    event's timestamp is 24 bits wide; a message's is 32 bits.
+    """
+
     timestamp_ms: int
     kind: str
     sop: int | None
     wire: bytes
+    code: int | None = None
+    raw: bytes = b""
 
 
 @dataclass(frozen=True)
@@ -240,42 +250,69 @@ class PdEventStream:
     events: list[PdEvent]
 
 
+@dataclass(frozen=True)
+class PdPayload:
+    """A PdPacket payload split leniently: what parsed, and why the rest did not.
+
+    ``status`` is None when the payload is shorter than the 12-byte status block. ``error``
+    describes the first record that could not be parsed; the records after it are lost,
+    because the record length comes from the broken header.
+    """
+
+    status: PdStatus | None
+    status_raw: bytes
+    events: list[PdEvent]
+    error: str | None
+
+
 def _parse_pd_status(payload: bytes) -> PdStatus:
     ts, vbus, ibus, cc1, cc2 = struct.unpack_from("<IHhHH", payload)
     return PdStatus(ts, vbus / 1000, ibus / 1000, cc1 / 1000, cc2 / 1000)
 
 
-def parse_pd(payload: bytes) -> PdStatus | PdEventStream:
-    """Parse a PdPacket attribute: a 12-byte status, or a status preamble plus events."""
+def split_pd(payload: bytes) -> PdPayload:
+    """Parse a PdPacket attribute without raising: keep every record before a corrupt one."""
     if len(payload) < PD_STATUS_SIZE:
-        raise ProtocolError(f"PD payload too short: {len(payload)} bytes")
-    preamble = _parse_pd_status(payload)
-    if len(payload) == PD_STATUS_SIZE:
-        return preamble
-
+        return PdPayload(None, bytes(payload), [], f"PD payload too short: {len(payload)} bytes")
+    status = _parse_pd_status(payload)
     events: list[PdEvent] = []
     offset = PD_STATUS_SIZE
     while offset < len(payload):
         if len(payload) - offset < PD_EVENT_HEADER_SIZE:
-            raise ProtocolError(f"truncated PD event header at offset {offset}")
-        head = payload[offset:offset + PD_EVENT_HEADER_SIZE]
-        offset += PD_EVENT_HEADER_SIZE
+            return PdPayload(status, bytes(payload[:PD_STATUS_SIZE]), events,
+                             f"truncated PD event header at offset {offset}")
+        head = bytes(payload[offset:offset + PD_EVENT_HEADER_SIZE])
         if head[0] == PD_EVENT_CONNECTION:
             ts = int.from_bytes(head[1:4], "little")
             code = head[5]
-            if code in PD_EVENT_CONNECT:
-                events.append(PdEvent(ts, "connect", None, b""))
-            elif code in PD_EVENT_DISCONNECT:
-                events.append(PdEvent(ts, "disconnect", None, b""))
-            else:
-                events.append(PdEvent(ts, "message", code, b""))
+            kind = ("connect" if code in PD_EVENT_CONNECT
+                    else "disconnect" if code in PD_EVENT_DISCONNECT else "connection")
+            events.append(PdEvent(ts, kind, None, b"", code, head))
+            offset += PD_EVENT_HEADER_SIZE
             continue
         wire_len = (head[0] & 0x3F) - 5
         if wire_len < 0:
-            raise ProtocolError(f"invalid PD event size flag 0x{head[0]:02x} at offset {offset - 6}")
-        if len(payload) - offset < wire_len:
-            raise ProtocolError(f"PD event needs {wire_len} wire bytes at offset {offset}")
+            return PdPayload(status, bytes(payload[:PD_STATUS_SIZE]), events,
+                             f"invalid PD event size flag 0x{head[0]:02x} at offset {offset}")
+        start = offset + PD_EVENT_HEADER_SIZE
+        if len(payload) - start < wire_len:
+            return PdPayload(status, bytes(payload[:PD_STATUS_SIZE]), events,
+                             f"PD event needs {wire_len} wire bytes at offset {start}")
+        wire = bytes(payload[start:start + wire_len])
         ts = struct.unpack_from("<I", head, 1)[0]
-        events.append(PdEvent(ts, "message", head[5], bytes(payload[offset:offset + wire_len])))
-        offset += wire_len
-    return PdEventStream(preamble, events)
+        events.append(PdEvent(ts, "message", head[5], wire, None, head + wire))
+        offset = start + wire_len
+    return PdPayload(status, bytes(payload[:PD_STATUS_SIZE]), events, None)
+
+
+def parse_pd(payload: bytes) -> PdStatus | PdEventStream:
+    """Parse a PdPacket attribute: a 12-byte status, or a status preamble plus events.
+
+    Raises :class:`ProtocolError` on a corrupt payload; :func:`split_pd` keeps what parsed.
+    """
+    split = split_pd(payload)
+    if split.error is not None:
+        raise ProtocolError(split.error)
+    if len(payload) == PD_STATUS_SIZE:
+        return split.status
+    return PdEventStream(split.status, split.events)

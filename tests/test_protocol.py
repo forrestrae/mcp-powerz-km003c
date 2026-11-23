@@ -58,7 +58,7 @@ def test_parse_putdata_truncated_raises():
 import struct  # noqa: E402
 
 from km003c_mcp.protocol import (  # noqa: E402
-    ATT_ADCQUEUE, PdStatus, parse_adcqueue, parse_pd, sequence_step,
+    ATT_ADCQUEUE, PdStatus, parse_adcqueue, parse_pd, sequence_step, split_pd,
 )
 
 
@@ -142,3 +142,31 @@ def test_parse_pd_real_contract_capture():
     assert decoded[0]["pdos"][0]["voltage_v"] == 5.0 and decoded[0]["pdos"][0]["max_current_a"] == 0.9
     assert "dual_role_power" in decoded[0]["pdos"][0]["flags"]
     assert decoded[2]["request"]["object_position"] == 1
+
+
+def test_split_pd_keeps_connection_codes_and_raw_records():
+    split = split_pd(PD_STREAM)
+    assert split.error is None and split.status_raw == bytes(12)
+    connect, message, disconnect = split.events
+    assert (connect.code, connect.raw) == (0x21, bytes.fromhex("451027000021"))
+    assert message.code is None
+    assert message.raw == bytes.fromhex("8b1a27000000") + bytes.fromhex("81112c910100")
+    assert (disconnect.kind, disconnect.code) == ("disconnect", 0x22)
+
+
+def test_split_pd_legacy_and_unknown_connection_codes():
+    payload = bytes(12) + bytes.fromhex("45cb57df0011") + bytes.fromhex("45cc57df0033")
+    legacy, unknown = split_pd(payload).events
+    assert (legacy.kind, legacy.code, legacy.timestamp_ms) == ("connect", 0x11, 0xDF57CB)
+    assert (unknown.kind, unknown.code, unknown.sop) == ("connection", 0x33, None)
+
+
+def test_split_pd_keeps_records_before_a_corrupt_one():
+    payload = PD_STREAM[:18] + bytes.fromhex("8b1a27000000") + bytes.fromhex("8111")
+    split = split_pd(payload)
+    assert [e.kind for e in split.events] == ["connect"]
+    assert "needs 6 wire bytes" in split.error
+    with pytest.raises(ProtocolError):
+        parse_pd(payload)
+    short = split_pd(bytes(5))
+    assert short.status is None and short.events == [] and "too short" in short.error

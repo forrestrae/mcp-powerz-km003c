@@ -1,5 +1,10 @@
-"""Hardware tests against a real KM003C. Run with KM003C_HW=1 and the POWER-Z PC software closed."""
+"""Hardware tests against a real KM003C. Run with KM003C_HW=1 and the POWER-Z PC software closed.
 
+Tests that need a person to plug cables also need KM003C_HW_INTERACTIVE=1; they prompt on the
+terminal (/dev/tty), so they work under pytest's output capture.
+"""
+
+import json
 import os
 import subprocess
 import sys
@@ -43,12 +48,24 @@ def test_hw_stream_1000sps(tools):
     assert st["samples"] >= 1500 and st["dropped_samples"] <= st["samples"] * 0.01
 
 
+def read_records(path):
+    with open(path) as f:
+        return [json.loads(line) for line in f]
+
+
 def test_hw_pd_capture_idle(tools):
-    assert tools.pd_capture_start()["started"]
+    started = tools.pd_capture_start(label="hw idle")
+    assert started["started"] and os.path.isabs(started["path"])
     time.sleep(0.5)
-    page = tools.pd_capture_read()
-    assert page["error"] is None
-    assert tools.pd_capture_stop()["stopped"]
+    summary = tools.pd_capture_read()
+    assert "error" not in summary and summary["running"] is True
+    stopped = tools.pd_capture_stop()
+    assert stopped["stopped"] and stopped["reason"] == "manual"
+    recs = read_records(started["path"])
+    assert recs[0]["meter"]["fw_version"] and recs[0]["meter"]["serial"]
+    assert recs[0]["pd_monitor"]["outcome"] in ("accepted", "already enabled or refused")
+    assert recs[-1]["type"] == "footer" and recs[-1]["vbus_mv"]["first"] is not None
+    assert any(r["type"] == "status" for r in recs)
 
 
 def test_hw_pd_capture_during_1000sps_stream(tools):
@@ -59,7 +76,7 @@ def test_hw_pd_capture_during_1000sps_stream(tools):
     time.sleep(2)
     status = tools.stream_status()
     assert status["running"] and status["error"] is None
-    assert tools.pd_capture_read()["error"] is None
+    assert "error" not in tools.pd_capture_read()
     assert tools.pd_capture_stop()["stopped"]
     st = tools.stream_stop()
     print(f"stream with capture: {st['samples']} samples, {st['dropped_samples']} dropped")
@@ -109,11 +126,11 @@ def test_hw_pd_capture_idle_2s(service):
     try:
         assert tools.pd_capture_start()["started"]
         time.sleep(2)
-        page = tools.pd_capture_read()
-        assert page["running"] and page["error"] is None
+        summary = tools.pd_capture_read()
+        assert summary["running"] and "error" not in summary
         assert svc.claimed  # the capture's lease keeps the meter claimed
         assert tools.pd_capture_stop()["stopped"]
-        assert tools.pd_capture_read()["error"] is None
+        assert tools.pd_capture_read()["reason"] == "manual"
         assert not svc.claimed
     finally:
         svc.shutdown()
@@ -168,3 +185,35 @@ def test_hw_trigger_and_usb_concurrently(trigger_tools):
     assert tools.stream_status()["error"] is None
     tools.stream_stop()
     tools.trigger_close()
+
+
+def test_hw_capture_stops_on_timeout(tools):
+    started = tools.pd_capture_start(stop_on="contract", timeout_s=1)
+    summary = tools.pd_capture_wait(timeout_s=5)
+    assert summary["running"] is False and summary["reason"] == "timeout"
+    assert read_records(started["path"])[-1]["reason"] == "timeout"
+
+
+def prompt(text: str, wait_for_enter: bool = True) -> None:
+    with open("/dev/tty", "r+") as tty:
+        tty.write(f"\n>>> {text}" + (" " if wait_for_enter else "\n"))
+        tty.flush()
+        if wait_for_enter:
+            tty.readline()
+
+
+@pytest.mark.skipif(os.environ.get("KM003C_HW_INTERACTIVE") != "1",
+                    reason="set KM003C_HW_INTERACTIVE=1; needs a cold attach by a person")
+def test_hw_cold_attach_stops_on_contract(tools):
+    firmware = tools.device_info()["fw_version"]
+    prompt("Unplug the meter from both the charger and the sink, then press Enter")
+    started = tools.pd_capture_start(label="hw cold attach", stop_on="contract", timeout_s=120,
+                                     provenance={"test": "test_hw_cold_attach_stops_on_contract"})
+    assert started["started"], started
+    prompt("Plug the meter into the sink, then the charger into the meter", wait_for_enter=False)
+    summary = tools.pd_capture_wait(timeout_s=130)
+    print(json.dumps(summary, indent=1))
+    recs = read_records(started["path"])
+    assert recs[0]["meter"]["fw_version"] == firmware
+    assert recs[-1]["type"] == "footer" and recs[-1]["reason"] == "contract"
+    assert summary["contract"] is not None and summary["warnings"] == []
