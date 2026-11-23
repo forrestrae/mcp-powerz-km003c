@@ -330,3 +330,43 @@ def test_pd_capture_started_during_a_stream_keeps_the_stream_polled():
     rec.stop_pd()
     rec.stop_stream()
     assert dev.graph == [("start", 3), ("stop",)]
+
+
+@pytest.mark.parametrize("value, expected", [
+    (None, 0.05), ("", 0.05), ("15", 0.015), ("1000", 1.0), ("2.5", 0.0025),
+    ("0", 0.05), ("-5", 0.05), ("fast", 0.05), ("nan", 0.05),
+    ("0.2", 0.001), ("60000", 10.0), ("inf", 10.0), ("1e308", 10.0),
+])
+def test_pd_poll_interval_from_env(monkeypatch, value, expected):
+    from km003c_mcp.recorder import pd_poll_interval_s
+    if value is None:
+        monkeypatch.delenv("KM003C_PD_POLL_MS", raising=False)
+    else:
+        monkeypatch.setenv("KM003C_PD_POLL_MS", value)
+    assert pd_poll_interval_s() == pytest.approx(expected)
+    assert Recorder(lambda: FakeDevice())._poll == pytest.approx(expected)
+
+
+def test_explicit_poll_interval_overrides_env(monkeypatch):
+    monkeypatch.setenv("KM003C_PD_POLL_MS", "15")
+    assert Recorder(lambda: FakeDevice(), poll_interval_s=0.2)._poll == 0.2
+
+
+def test_long_pd_poll_interval_does_not_slow_a_stream():
+    # A 50 SPS stream must still be drained every 50 ms when the PD interval is long.
+    dev = FakeDevice()
+    rec = Recorder(lambda: dev, poll_interval_s=5.0)
+    rec.start_stream(2)
+    time.sleep(0.3)
+    rec.stop_stream()
+    assert len(dev.masks) >= 4
+
+
+def test_poller_failure_at_its_sleep_is_reported():
+    # time.sleep(inf) raises OverflowError; it must end the capture visibly, not silently.
+    dev = FakeDevice()
+    rec = Recorder(lambda: dev, poll_interval_s=float("inf"))
+    rec.start_pd()
+    wait_until(lambda: not rec.pd_events()["running"])
+    assert "OverflowError" in rec.pd_events()["error"]
+    assert dev.monitor == ["enable", "disable"]
