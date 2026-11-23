@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -136,13 +139,116 @@ def _serial_of(dev) -> str:
         return ""
 
 
+LIKELY_HOLDERS = ("another agent session's km003c MCP server (it keeps the meter claimed, "
+                  "for example while a capture or stream runs), the ChargerLab POWER-Z PC "
+                  "software, or a script using the meter")
+
+_IOREG_NODE = re.compile(r"\+-o .*<class (\w+)")
+_IOREG_PROPERTY = re.compile(r'"([^"]+)" = (.*)$')
+
+
+def parse_exclusive_owner(ioreg_text: str, serial: str | None = None) -> str | None:
+    """Return the ``UsbExclusiveOwner`` of the KM003C's interface 0 in ``ioreg -l -w0`` text.
+
+    macOS records the process holding a USB interface as, for example,
+    ``"pid 46945, python3.14"``. The device node carries the same value when a process
+    holds the whole device, so it is used when interface 0 names no process. Only nodes
+    with the meter's VID and PID, and the given serial number if any, are considered.
+    """
+    nodes: list[tuple[str, dict[str, str]]] = []
+    for line in ioreg_text.splitlines():
+        node = _IOREG_NODE.search(line)
+        if node:
+            nodes.append((node.group(1), {}))
+            continue
+        prop = _IOREG_PROPERTY.search(line)
+        if prop and nodes:
+            nodes[-1][1][prop.group(1)] = prop.group(2).strip().strip('"')
+    interface_owner = device_owner = None
+    for cls_name, props in nodes:
+        if props.get("idVendor") != str(VID) or props.get("idProduct") != str(PID):
+            continue
+        if serial and props.get("USB Serial Number", props.get("kUSBSerialNumberString")) != serial:
+            continue
+        owner = props.get("UsbExclusiveOwner")
+        if not owner:
+            continue
+        if cls_name == "IOUSBHostInterface" and props.get("bInterfaceNumber") == str(INTERFACE):
+            interface_owner = interface_owner or owner
+        elif cls_name == "IOUSBHostDevice" and owner.startswith("pid "):
+            device_owner = device_owner or owner
+    if interface_owner and interface_owner.startswith("pid "):
+        return interface_owner
+    return device_owner or interface_owner
+
+
+IOREG = "/usr/sbin/ioreg"
+
+
+def ioreg_exclusive_owner(serial: str | None = None) -> str | None:
+    """Name the process holding the meter on macOS, or None elsewhere or on any failure."""
+    if sys.platform != "darwin":
+        return None
+    # The absolute path keeps a stray ioreg earlier on PATH from answering.
+    ioreg = IOREG if os.path.exists(IOREG) else "ioreg"
+    try:
+        result = subprocess.run([ioreg, "-l", "-w0"], capture_output=True, text=True,
+                                errors="replace", timeout=5, check=True)
+        return parse_exclusive_owner(result.stdout, serial)
+    except Exception:  # noqa: BLE001 - the holder's name is optional detail
+        return None
+
+
+# Claim failures known to mean another handle holds the interface: ENODEV is what macOS
+# reports for a held interface, EBUSY and EACCES what Linux and Windows report. Other claim
+# failures still raise DeviceBusyError, without the holder lookup.
+BUSY_ERRNOS = (19, 16, 13)
+_HOLDER_PID = re.compile(r"pid (\d+)")
+
+
+def busy_error(exc: BaseException, serial: str | None, holder: str | None,
+               own_pid: int | None = None) -> DeviceBusyError:
+    """Build the error for a meter that enumerates but whose interface cannot be claimed.
+
+    On macOS a held interface fails with errno 19 (ENODEV, "it may have been disconnected"),
+    which misstates the cause; elsewhere it is EBUSY or an access error. When the holder is
+    this process (``own_pid``, default :func:`os.getpid`), a handle of its own leaked.
+    """
+    meter = f"the KM003C {serial}" if serial else "the KM003C"
+    pid = _HOLDER_PID.match(holder or "")
+    if pid and int(pid.group(1)) == (os.getpid() if own_pid is None else own_pid):
+        return DeviceBusyError(
+            f"{meter} is held by this same process ({holder}): its USB interface cannot be "
+            f"claimed ({exc}) because an earlier handle in this process was not released. "
+            "Restart the server.")
+    who = f"another process ({holder})" if holder else "another process"
+    return DeviceBusyError(
+        f"{meter} is held by {who}: its USB interface cannot be claimed ({exc}). "
+        f"Likely holders: {LIKELY_HOLDERS}. Close it and retry.")
+
+
+def claim_error(exc: BaseException, serial: str | None) -> DeviceBusyError:
+    """Build the error for a claim failure whose cause is not one of :data:`BUSY_ERRNOS`.
+
+    The error code does not show that another process holds the meter, but that is still the
+    likely cause, for example on a Windows backend reporting another code.
+    """
+    meter = f"the KM003C {serial}" if serial else "the KM003C"
+    return DeviceBusyError(
+        f"the USB interface of {meter} could not be claimed ({exc}). The likely cause is "
+        f"another program holding the meter: {LIKELY_HOLDERS}. Close it and retry.")
+
+
 class PyUsbTransport:
     def __init__(self, dev, serial_number: str) -> None:
         self._dev = dev
         self.serial_number = serial_number
 
     @classmethod
-    def open(cls, serial: str | None = None) -> PyUsbTransport:
+    def open(cls, serial: str | None = None,
+             holder_lookup: Callable[[str | None], str | None] | None = None) -> PyUsbTransport:
+        """Find and claim the meter. ``holder_lookup`` names the process holding a busy meter;
+        it defaults to :func:`ioreg_exclusive_owner`."""
         serial = serial or os.environ.get("KM003C_SERIAL") or None
         devices = _find_devices()
         if not devices:
@@ -162,9 +268,15 @@ class PyUsbTransport:
             dev.set_configuration()
             usb.util.claim_interface(dev, INTERFACE)
         except (usb.core.USBError, NotImplementedError) as exc:
-            raise DeviceBusyError(
-                f"cannot claim the KM003C vendor interface ({exc}); "
-                "close the POWER-Z PC software or any other program using the meter") from exc
+            dev_serial = _serial_of(dev) or serial
+            # Close the handle the failed attempt opened. While it stays open, for example
+            # because the raised error's traceback keeps ``dev`` alive, macOS refuses this
+            # process's next claim with errno 19 even after the other holder has exited.
+            usb.util.dispose_resources(dev)
+            if getattr(exc, "errno", None) not in BUSY_ERRNOS:
+                raise claim_error(exc, dev_serial) from exc
+            lookup = holder_lookup or ioreg_exclusive_owner
+            raise busy_error(exc, dev_serial, lookup(dev_serial)) from exc
         return cls(dev, _serial_of(dev))
 
     def write(self, data: bytes, timeout_ms: int) -> None:

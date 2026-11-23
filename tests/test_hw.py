@@ -1,11 +1,14 @@
 """Hardware tests against a real KM003C. Run with KM003C_HW=1 and the POWER-Z PC software closed."""
 
 import os
+import subprocess
+import sys
 import time
 
 import pytest
 
 from km003c_mcp.server import Km003cService, build_tools
+from km003c_mcp.usb_device import DeviceBusyError, PyUsbTransport
 
 pytestmark = [pytest.mark.hw,
               pytest.mark.skipif(os.environ.get("KM003C_HW") != "1", reason="set KM003C_HW=1")]
@@ -74,6 +77,33 @@ def test_hw_pd_monitor_enable(service, tools):
     # stop disabled the monitor, so the next enable is accepted.
     assert tools.pd_capture_start()["pd_monitor"]["accepted"]
     assert tools.pd_capture_stop()["stopped"]
+
+
+HOLDER = """
+import sys
+from km003c_mcp.usb_device import PyUsbTransport
+t = PyUsbTransport.open()
+print("holding", flush=True)
+sys.stdin.read()
+t.close()
+"""
+
+
+def test_hw_busy_error_names_the_holder(service):
+    service.shutdown()  # release this session's claim; later tests reopen on demand
+    holder = subprocess.Popen([sys.executable, "-c", HOLDER], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "holding"
+        with pytest.raises(DeviceBusyError) as info:
+            PyUsbTransport.open()
+    finally:
+        holder.communicate(timeout=10)
+    msg = str(info.value)
+    assert "held by another process" in msg and "Likely holders" in msg
+    if sys.platform == "darwin":
+        assert f"pid {holder.pid}," in msg
+    PyUsbTransport.open().close()  # free again once the holder exits
 
 
 def test_hw_trigger_open_close(tools):
