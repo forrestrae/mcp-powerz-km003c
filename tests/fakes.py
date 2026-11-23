@@ -21,6 +21,7 @@ class FakeTransport:
         self.writes: list[bytes] = []
         self.serial_number = serial_number
         self.closed = False
+        self.resets = 0
 
     def write(self, data: bytes, timeout_ms: int) -> None:
         self.writes.append(bytes(data))
@@ -35,6 +36,10 @@ class FakeTransport:
         return item
 
     def close(self) -> None:
+        self.closed = True
+
+    def reset(self) -> None:
+        self.resets += 1
         self.closed = True
 
 

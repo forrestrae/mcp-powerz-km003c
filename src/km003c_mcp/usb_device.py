@@ -60,6 +60,14 @@ class DeviceTimeoutError(TransportError):
     pass
 
 
+class MeterLaggingError(TransportError):
+    """Connect timed out while replies to earlier requests kept arriving.
+
+    On firmware 2.0.0 the meter once answered every request one request late, so each read
+    returned the reply to the previous request. A USB device reset cleared it.
+    """
+
+
 class CommandRejectedError(Km003cError):
     pass
 
@@ -95,6 +103,9 @@ class UsbTransport(Protocol):
     def read(self, size: int, timeout_ms: int) -> bytes: ...
 
     def close(self) -> None: ...
+
+    def reset(self) -> None:
+        """Reset the USB device and drop this handle; the caller opens a new transport."""
 
 
 def _backend():
@@ -302,6 +313,15 @@ class PyUsbTransport:
             pass
         usb.util.dispose_resources(self._dev)
 
+    def reset(self) -> None:
+        """Reset the meter's USB device (``libusb_reset_device``); the meter re-enumerates."""
+        try:
+            self._dev.reset()
+        except usb.core.USBError as exc:
+            # The reset itself can report an error once the device re-enumerates.
+            log.debug("USB reset reported %s", exc)
+        usb.util.dispose_resources(self._dev)
+
 
 def _cmd(packet: bytes) -> int:
     return packet[0] & 0x7F if packet else -1
@@ -326,8 +346,12 @@ class Km003cDevice:
         return self._tid
 
     def _transact(self, packet: bytes, match: Callable[[bytes], bool],
-                  timeout_ms: int = TIMEOUT_MS) -> bytes:
-        """Send a packet and return the first reply accepted by ``match``; drop the rest."""
+                  timeout_ms: int = TIMEOUT_MS,
+                  on_drop: Callable[[bytes], None] | None = None) -> bytes:
+        """Send a packet and return the first reply accepted by ``match``; drop the rest.
+
+        ``on_drop`` sees each dropped packet.
+        """
         self.transport.write(packet, timeout_ms)
         deadline = time.monotonic() + timeout_ms / 1000
         while True:
@@ -337,6 +361,8 @@ class Km003cDevice:
             reply = self.transport.read(READ_SIZE, remaining)
             if len(reply) >= 4 and match(reply):
                 return reply
+            if on_drop is not None:
+                on_drop(reply)
             log.debug("dropping unmatched packet %s", reply[:8].hex())
 
     def _control(self, cmd: int, attribute: int = 0, timeout_ms: int = TIMEOUT_MS) -> bytes:
@@ -346,11 +372,29 @@ class Km003cDevice:
                               timeout_ms)
 
     def connect(self) -> None:
+        """Send Connect until Accepted.
+
+        Raises :class:`MeterLaggingError` when every attempt timed out and a reply carrying
+        the transaction id of an earlier attempt arrived meanwhile: the meter answered, one
+        request late. Other unmatched packets, such as the meter's fixed-TID Disconnect
+        (``03 11 00 00``), do not count.
+        """
         with self.lock:
             last: Exception | None = None
+            sent: list[int] = []
+            late = 0
+
+            def dropped(reply: bytes) -> None:
+                nonlocal late
+                if reply[1:2] and reply[1] in sent[:-1]:
+                    late += 1
+
             for attempt in range(CONNECT_ATTEMPTS):
+                tid = self._next_tid()
+                sent.append(tid)
                 try:
-                    reply = self._control(CMD_CONNECT)
+                    reply = self._transact(encode_ctrl(CMD_CONNECT, tid),
+                                           lambda r: r[1] == tid, on_drop=dropped)
                     if _cmd(reply) == CMD_ACCEPT:
                         return
                     last = CommandRejectedError(f"Connect answered with 0x{_cmd(reply):02x}")
@@ -358,6 +402,10 @@ class Km003cDevice:
                     last = exc
                 if attempt < CONNECT_ATTEMPTS - 1:
                     time.sleep(0.1)
+            if isinstance(last, DeviceTimeoutError) and late:
+                raise MeterLaggingError(
+                    f"cannot connect to the KM003C: Connect timed out while {late} replies "
+                    "to earlier requests arrived; the meter is answering late")
             raise Km003cError(f"cannot connect to the KM003C: {last}")
 
     def disconnect(self) -> None:

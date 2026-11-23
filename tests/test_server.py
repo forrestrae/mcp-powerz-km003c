@@ -1,9 +1,10 @@
 import pytest
 
+import km003c_mcp.server as srv
 from fakes import FakeSerial, FakeTransport, live_adc_with_tid
 from km003c_mcp.server import Km003cService, build_tools
 from km003c_mcp.trigger import TriggerPort
-from km003c_mcp.usb_device import DeviceBusyError, DeviceNotFoundError
+from km003c_mcp.usb_device import DeviceBusyError, DeviceNotFoundError, DeviceTimeoutError
 
 ACCEPT_1 = bytes.fromhex("05010000")
 
@@ -151,3 +152,78 @@ def test_pd_capture_start_fails_when_monitor_never_enabled(monkeypatch):
     r = tools.pd_capture_start()
     assert r["kind"] == "PdMonitorNotEnabledError"
     assert tools.pd_capture_read()["running"] is False
+
+
+def lagging_transport():
+    """A meter answering one request late: each Connect reads the previous Connect's reply."""
+    timeout = DeviceTimeoutError("no reply")
+    return FakeTransport([timeout, bytes.fromhex("05010000"), timeout,
+                          bytes.fromhex("05020000"), timeout])
+
+
+def test_lagging_meter_is_reset_once_and_reopened(monkeypatch):
+    monkeypatch.setattr(srv, "RESET_REOPEN_DELAY_S", 0)
+    lagging, healthy = lagging_transport(), FakeTransport(opened(live_adc_with_tid(3)))
+    transports = [lagging, healthy]
+    tools, _ = make_tools(factory=lambda: transports.pop(0))
+    assert "vbus_v" in tools.measure()
+    assert lagging.resets == 1 and healthy.resets == 0 and transports == []
+
+
+def test_lagging_meter_after_reset_gives_a_clear_error(monkeypatch):
+    monkeypatch.setattr(srv, "RESET_REOPEN_DELAY_S", 0)
+    opened_transports = [lagging_transport(), lagging_transport()]
+    transports = list(opened_transports)
+    tools, _ = make_tools(factory=lambda: transports.pop(0))
+    r = tools.measure()
+    assert r["kind"] == "Km003cError" and "after a USB reset" in r["error"]
+    assert [t.resets for t in opened_transports] == [1, 0] and opened_transports[1].closed
+
+
+def test_reopen_after_reset_waits_for_the_meter(monkeypatch):
+    monkeypatch.setattr(srv, "RESET_REOPEN_DELAY_S", 0)
+    attempts = [lagging_transport(), DeviceNotFoundError("re-enumerating"),
+                FakeTransport(opened(live_adc_with_tid(3)))]
+
+    def factory():
+        item = attempts.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+    tools, _ = make_tools(factory=factory)
+    assert "vbus_v" in tools.measure() and attempts == []
+
+
+def test_plain_connect_failure_does_not_reset():
+    silent = FakeTransport([])
+    tools, _ = make_tools(factory=lambda: silent)
+    r = tools.measure()
+    assert r["kind"] == "Km003cError" and "cannot connect" in r["error"]
+    assert silent.resets == 0 and silent.closed
+
+
+def test_reopen_after_reset_says_the_meter_did_not_come_back(monkeypatch):
+    monkeypatch.setattr(srv, "RESET_REOPEN_DELAY_S", 0)
+    attempts = [lagging_transport()]
+
+    def factory():
+        if attempts:
+            return attempts.pop(0)
+        raise DeviceNotFoundError("no POWER-Z KM003C found")
+    tools, _ = make_tools(factory=factory)
+    r = tools.measure()
+    assert r["kind"] == "Km003cError" and "did not come back" in r["error"]
+    assert "answers late" not in r["error"]
+
+
+def test_reopen_after_reset_skips_the_holder_lookup(monkeypatch):
+    monkeypatch.setattr(srv, "RESET_REOPEN_DELAY_S", 0)
+    lookups = []
+    transports = [lagging_transport(), FakeTransport(opened(live_adc_with_tid(3)))]
+
+    def factory(holder_lookup=None):
+        lookups.append(holder_lookup)
+        return transports.pop(0)
+    tools, _ = make_tools(factory=factory)
+    assert "vbus_v" in tools.measure()
+    assert lookups[0] is None and lookups[1] is not None and lookups[1]("053893") is None
