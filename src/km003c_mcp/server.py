@@ -8,6 +8,7 @@ import functools
 import inspect
 import logging
 import os
+import signal
 import threading
 import time
 from collections import Counter
@@ -662,6 +663,35 @@ tools = build_tools(service)
 mcp = build_server(tools)
 
 
+# After SIGTERM the server exits this long after starting its cleanup, even if a step hangs.
+SIGTERM_EXIT_DEADLINE_S = 10.0
+
+
+def install_sigterm_handler(service: Km003cService, exit_fn: Callable[[int], None] = os._exit,
+                            deadline_s: float = SIGTERM_EXIT_DEADLINE_S) -> None:
+    """On SIGTERM, stop a running capture and stream, release the meter, and exit 0.
+
+    A running capture gets its footer with reason ``manual``. The cleanup runs on its own
+    thread, because the signal can arrive while the main thread holds a lock the cleanup
+    needs; the process exits when it is done, or after ``deadline_s`` at the latest.
+    """
+    def stop_and_exit() -> None:
+        try:
+            service.shutdown()
+        finally:
+            exit_fn(0)
+
+    def on_sigterm(signum, frame) -> None:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        threading.Thread(target=stop_and_exit, name="km003c-sigterm", daemon=True).start()
+        watchdog = threading.Timer(deadline_s, exit_fn, args=(0,))
+        watchdog.daemon = True
+        watchdog.start()
+
+    signal.signal(signal.SIGTERM, on_sigterm)
+
+
 def main() -> None:
     atexit.register(service.shutdown)
+    install_sigterm_handler(service)
     mcp.run()
