@@ -55,6 +55,7 @@ claude mcp add km003c -- <repo>\.venv\Scripts\km003c-mcp.exe
 |---|---|
 | `KM003C_SERIAL` | Pick a meter by USB serial number when several are attached |
 | `KM003C_COM_PORT` | Override the trigger's virtual serial port (e.g. `COM14`) |
+| `KM003C_ENABLE_TRIGGER` | `1` registers the `trigger_*` tools. Any other value, such as `0` or `false`, leaves every one of them out of the tool list, so an agent can neither see nor call them. Unset registers them |
 | `KM003C_IDLE_RELEASE_S` | Release the meter's USB interface this many seconds after the last tool call, PD capture, or stream that uses it ends; the next call claims it again. `0` releases at once. Unset, or `never`, keeps the meter claimed until the server exits |
 | `KM003C_PD_POLL_MS` | PD capture poll interval in milliseconds, 1 to 10000 (default 50; the meter buffers a whole negotiation between polls) |
 | `KM003C_LIBUSB` | Load libusb-1.0 from this file instead of the bundled one (`KM003C_LIBUSB_DLL` is the older name and still works) |
@@ -75,8 +76,12 @@ claude mcp add km003c -- <repo>\.venv\Scripts\km003c-mcp.exe
 | `trigger_reset` / `trigger_close` / `trigger_raw` | Reset, leave trigger mode, or send any documented command |
 
 Trigger requests make the charger raise VBUS on the meter's output — disconnect
-sensitive loads first. Positive IBUS means current flows from the meter's USB-C
-receptacle (input) to its plug (output).
+sensitive loads first. With `KM003C_ENABLE_TRIGGER=0` none of the trigger tools is
+registered, `trigger_detect` included, because protocol probing can also make a charger
+change VBUS.
+
+Positive IBUS means current flows from the meter's USB-C receptacle (input) to its plug
+(output).
 
 ## Tests
 
