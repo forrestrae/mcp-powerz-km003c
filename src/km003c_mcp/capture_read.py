@@ -439,7 +439,11 @@ def warnings(capture: Capture, negs: list[dict] | None = None) -> list[str]:
     conn = [e for e in capture.entries if e.kind == "conn"]
     if not capture.messages and conn:
         monitor = capture.header.get("pd_monitor")
-        out.append("only connection events, no PD messages: PD monitoring was not active "
+        # Two causes: no PD traffic at all (a partner that does not use PD), or a meter whose
+        # PD monitoring was off. Firmware 2.0.0 captures PD with the monitor off, so on that
+        # firmware the first is the likely one.
+        out.append("only connection events, no PD messages: no PD traffic (for example a "
+                   "non-PD partner) or PD monitoring not active "
                    f"(header pd_monitor: {json.dumps(monitor, separators=(',', ':'))})")
     elif not has_caps and not has_request and flat:
         span = "no VBUS reading" if vbus["min"] is None else \

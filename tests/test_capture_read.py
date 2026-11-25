@@ -93,7 +93,7 @@ def test_sanity_rule_only_connection_events(tmp_path):
         {"type": "footer", "reason": "timeout"},
     ])
     warnings = cr.read(path)["warnings"]
-    assert any("PD monitoring was not active" in w and "already enabled or refused" in w
+    assert any("no PD traffic" in w and "PD monitoring not active" in w and "already enabled or refused" in w
                for w in warnings)
 
 
