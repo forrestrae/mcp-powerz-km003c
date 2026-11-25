@@ -478,11 +478,6 @@ SUMMARY_MAX_WARNINGS = 5
 SUMMARY_MAX_COUNT_TYPES = 16
 
 
-def _clip_left(text: str, limit: int) -> str:
-    """``text`` cut from the left to ``limit`` characters; the end of a path matters most."""
-    return text if len(text) <= limit else "..." + text[-(limit - 3):]
-
-
 def _scalar(value, limit: int):
     return clip(value, limit) if isinstance(value, str) else value
 
@@ -493,8 +488,9 @@ def summary(capture: Capture, max_bytes: int = SUMMARY_MAX_BYTES,
     errors), counts, VBUS, the final contract and the sanity warnings.
 
     The compact JSON of the returned object, ``extra`` fields included, stays within
-    ``max_bytes``: lines from the middle go first, then warnings, counts and the contract,
-    and long fields are cut throughout.
+    ``max_bytes`` plus the length of ``path``: lines from the middle go first, then warnings,
+    counts and the contract, and long fields are cut throughout. ``path`` is always the whole
+    absolute path, because a shortened one cannot be used to read the file again.
     """
     negs = negotiations(capture)
     footer = capture.footer
@@ -515,7 +511,7 @@ def summary(capture: Capture, max_bytes: int = SUMMARY_MAX_BYTES,
     if contract is not None:
         contract["text"] = clip(contract["text"], 120)
     out: dict = {
-        "path": _clip_left(str(capture.path), 200),
+        "path": str(capture.path),
         "label": _scalar(header.get("label") or None, 80),
         "meter_fw": _scalar((header.get("meter") or {}).get("fw_version"), 40),
         "pd_monitor": _scalar((header.get("pd_monitor") or {}).get("outcome"), 60),
@@ -533,7 +529,7 @@ def summary(capture: Capture, max_bytes: int = SUMMARY_MAX_BYTES,
     out["truncated"] = False
 
     def fits() -> bool:
-        return len(_compact(out)) <= max_bytes
+        return len(_compact(out)) - len(_compact(out["path"])) <= max_bytes
 
     if fits():
         return out
@@ -566,14 +562,14 @@ def summary(capture: Capture, max_bytes: int = SUMMARY_MAX_BYTES,
                    lambda: out.update(warnings=[]),
                    lambda: out.update(contract=None if out["contract"] is None else
                                       {k: out["contract"][k] for k in ("rdo", "pdo")}),
-                   lambda: out.update(label=None, path=_clip_left(out["path"], 60)),
+                   lambda: out.update(label=None),
                    lambda: out.update(lines=[])):
         if fits():
             return out
         shrink()
     if fits():
         return out
-    return {"path": _clip_left(out["path"], 60), "reason": out["reason"], "truncated": True,
+    return {"path": out["path"], "reason": out["reason"], "truncated": True,
             "lines": [], "warnings": ["summary too large; read mode=messages or facts"]}
 
 

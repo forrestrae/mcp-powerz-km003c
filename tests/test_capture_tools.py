@@ -310,6 +310,7 @@ def test_stop_and_wait_results_stay_within_the_summary_bound(bench_factory):
     waited = bench.tools.pd_capture_wait(timeout_s=10)
     stopped = bench.tools.pd_capture_stop()
     for out in (waited, stopped):
-        assert len(_json.dumps(out, separators=(",", ":"))) <= SUMMARY_MAX_BYTES
+        whole = len(_json.dumps(out, separators=(",", ":")))
+        assert whole - len(_json.dumps(out["path"])) <= SUMMARY_MAX_BYTES
         assert "running" in out
     assert stopped["stopped"] is False

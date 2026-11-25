@@ -554,10 +554,11 @@ def build_tools(service: Km003cService, enable_trigger: bool | None = None) -> S
         """Read a capture file; never touches the meter. Without path: the running or last
         capture of this session.
 
-        mode summary (default): about 2 KB at most; one line per non-GoodCRC message such as
-        "t=84002 SOP Request pos 4, 3.0 A [8210 2cb18441]", connection events and marks,
-        counts, VBUS first/last/min/max (mV), the final contract, and warnings from the
-        sanity rules (no negotiation, PD monitoring inactive, capture started late).
+        mode summary (default): about 2 KB at most plus the whole path; one line per
+        non-GoodCRC message such as "t=84002 SOP Request pos 4, 3.0 A [8210 2cb18441]",
+        connection events and marks, counts, VBUS first/last/min/max (mV), the final
+        contract, and warnings from the sanity rules (no negotiation, PD monitoring
+        inactive, capture started late).
         messages: the same lines, filtered and paged (limit default 50): pass a page's
         next_after as after for the next page; next_after is absent on the last page. facts: Source_Capabilities PDOs, Request RDOs with their
         object position, Accept and PS_RDY times, and Discover Identity ACKs grouped by SOP
