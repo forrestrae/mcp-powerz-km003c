@@ -52,7 +52,7 @@ def test_golden_header_and_footer():
     recs = records(GOLDEN)
     header, footer = recs[0], recs[-1]
     assert header["format"] == "km003c-capture" and header["version"] == 1
-    assert header["meter"] == {"serial": "053893", "fw_version": "2.0.0", "hw_version": "2.3",
+    assert header["meter"] == {"serial": "000000", "fw_version": "2.0.0", "hw_version": "2.3",
                                "model": "KM003C"}
     assert header["pd_monitor"]["enabled"] is True and header["pd_monitor"]["attempts"] == 1
     assert footer["type"] == "footer" and footer["reason"] == "messages"

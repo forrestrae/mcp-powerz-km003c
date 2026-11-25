@@ -56,7 +56,7 @@ def _cstr_block(size: int, fields: dict[int, str]) -> bytes:
 METER_MEMORY = {
     0x00000420: _cstr_block(64, {0x10: "KM003C", 0x1C: "2.3", 0x28: "2025.4.15"}),
     0x00004420: b"\x01\x00\x00\x00" + _cstr_block(60, {0x18: "2.0.0", 0x24: "2025.2.20"}),
-    0x03000C00: _cstr_block(64, {0x00: "053893"}),
+    0x03000C00: _cstr_block(64, {0x00: "000000"}),
     0x40010450: bytes.fromhex("3037314b42500dff110affff"),
 }
 PD_STATUS_STEP_MS = 15

@@ -51,7 +51,7 @@ def test_record_announces_the_path_and_stops_on_contract(monkeypatch, tmp_path, 
     monkeypatch.setenv("KM003C_PD_POLL_MS", "1")
     real = srv.Km003cService
     monkeypatch.setattr(srv, "Km003cService", lambda **kw: real(
-        transport_factory=lambda: MeterFake(serial_number="053893", pd_payloads=S3), **kw))
+        transport_factory=lambda: MeterFake(serial_number="000000", pd_payloads=S3), **kw))
     path = tmp_path / "cold.jsonl"
     code = main(["record", "--stop-on", "contract", "--timeout", "20", "--label", "cold",
                  "--provenance", '{"charger": "Apple 140 W"}', str(path)])
