@@ -1,6 +1,6 @@
 """PD capture tools end to end: real meter payloads through the fake transport into files.
 
-Set KM003C_UPDATE_GOLDEN=1 to rewrite tests/fixtures/s3_golden.jsonl after a deliberate
+Set KM003C_UPDATE_GOLDEN=1 to rewrite tests/fixtures/golden_15ms.jsonl after a deliberate
 format change, then review the diff.
 """
 
@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from capture_bench import GOLDEN, S3, CaptureBench, normalize, records, s3_until
+from capture_bench import GOLDEN, POLL_15MS, CaptureBench, normalize, records, poll_15ms_until
 from fakes import CORRUPT_PUTDATA, FakeTransport, live_adc_with_tid
 from km003c_mcp.protocol import ATT_ADC, ATT_PD, CMD_PUT_DATA
 from km003c_mcp.recorder import MAX_CONSECUTIVE_PROTOCOL_ERRORS
@@ -35,11 +35,11 @@ def non_goodcrc(recs):
 
 
 def test_golden_jsonl_from_real_payloads(bench_factory, tmp_path):
-    bench = bench_factory(S3)
+    bench = bench_factory(POLL_15MS)
     started = bench.tools.pd_capture_start(
-        path=str(tmp_path / "s3.jsonl"), label="S3 replay",
-        provenance={"source": "Phase 1 spike S3, firmware 2.0.0"}, stop_after_messages=8)
-    assert started["started"] and started["path"] == str((tmp_path / "s3.jsonl").resolve())
+        path=str(tmp_path / "replay.jsonl"), label="15 ms replay",
+        provenance={"source": "reference capture, 15 ms poll, firmware 2.0.0"}, stop_after_messages=8)
+    assert started["started"] and started["path"] == str((tmp_path / "replay.jsonl").resolve())
     summary = bench.tools.pd_capture_wait(timeout_s=20)
     assert summary["reason"] == "messages" and summary["running"] is False
     produced = [normalize(r) for r in records(started["path"])]
@@ -70,7 +70,7 @@ def test_golden_header_and_footer():
 
 
 def test_stop_on_contract(bench_factory):
-    bench = bench_factory(S3)
+    bench = bench_factory(POLL_15MS)
     path = bench.tools.pd_capture_start(stop_on="contract")["path"]
     assert bench.tools.pd_capture_wait(timeout_s=10)["reason"] == "contract"
     msgs = non_goodcrc(records(path))
@@ -80,7 +80,7 @@ def test_stop_on_contract(bench_factory):
 
 
 def test_stop_on_contract_with_settle_keeps_capturing(bench_factory):
-    bench = bench_factory(S3)
+    bench = bench_factory(POLL_15MS)
     path = bench.tools.pd_capture_start(stop_on="contract", settle_ms=3200)["path"]
     assert bench.tools.pd_capture_wait(timeout_s=10)["reason"] == "contract"
     recs = records(path)
@@ -92,7 +92,7 @@ def test_stop_on_contract_with_settle_keeps_capturing(bench_factory):
 
 
 def test_stop_on_identity(bench_factory):
-    bench = bench_factory(S3)
+    bench = bench_factory(POLL_15MS)
     path = bench.tools.pd_capture_start(stop_on="identity")["path"]
     assert bench.tools.pd_capture_wait(timeout_s=10)["reason"] == "identity"
     msgs = non_goodcrc(records(path))
@@ -101,7 +101,7 @@ def test_stop_on_identity(bench_factory):
 
 
 def test_stop_after_messages_counts_non_goodcrc(bench_factory):
-    bench = bench_factory(S3)
+    bench = bench_factory(POLL_15MS)
     path = bench.tools.pd_capture_start(stop_after_messages=3)["path"]
     assert bench.tools.pd_capture_wait(timeout_s=10)["reason"] == "messages"
     recs = records(path)
@@ -109,7 +109,7 @@ def test_stop_after_messages_counts_non_goodcrc(bench_factory):
 
 
 def test_timeout_when_the_condition_is_not_met(bench_factory):
-    bench = bench_factory(s3_until("82102cb18441"))  # stops before Accept and PS_RDY
+    bench = bench_factory(poll_15ms_until("82102cb18441"))  # stops before Accept and PS_RDY
     bench.tools.pd_capture_start(stop_on="contract", timeout_s=0.3)
     summary = bench.tools.pd_capture_wait(timeout_s=5)
     assert summary["reason"] == "timeout"
@@ -117,13 +117,13 @@ def test_timeout_when_the_condition_is_not_met(bench_factory):
 
 
 def test_timeout_during_settle_keeps_the_condition_as_reason(bench_factory):
-    bench = bench_factory(S3)
+    bench = bench_factory(POLL_15MS)
     bench.tools.pd_capture_start(stop_on="contract", settle_ms=10_000_000, timeout_s=0.5)
     assert bench.tools.pd_capture_wait(timeout_s=5)["reason"] == "contract"
 
 
 def test_wait_returns_while_running_and_mark_and_manual_stop(bench_factory):
-    bench = bench_factory(S3)
+    bench = bench_factory(POLL_15MS)
     path = bench.tools.pd_capture_start()["path"]
     early = bench.tools.pd_capture_wait(timeout_s=0.05)
     assert early["running"] is True and early["reason"] is None
@@ -140,14 +140,14 @@ def test_wait_returns_while_running_and_mark_and_manual_stop(bench_factory):
 
 
 def test_second_start_is_refused_while_running(bench_factory):
-    bench = bench_factory(S3)
+    bench = bench_factory(POLL_15MS)
     bench.tools.pd_capture_start()
     assert bench.tools.pd_capture_start()["kind"] == "Km003cError"
     bench.tools.pd_capture_stop()
 
 
 def test_corrupt_payload_mid_capture_is_recorded_and_capture_continues(bench_factory):
-    payloads = list(S3)
+    payloads = list(POLL_15MS)
     k = next(i for i, p in enumerate(payloads) if "82102cb18441" in p.hex())
     payloads[k] = payloads[k][:-1]  # the last record (a GoodCRC) loses a byte
     bench = bench_factory(payloads)
@@ -162,7 +162,7 @@ def test_corrupt_payload_mid_capture_is_recorded_and_capture_continues(bench_fac
 
 
 def test_corrupt_putdata_is_recorded_and_capture_continues(bench_factory):
-    bench = bench_factory([S3[0], CORRUPT_PUTDATA, *S3[1:]])
+    bench = bench_factory([POLL_15MS[0], CORRUPT_PUTDATA, *POLL_15MS[1:]])
     path = bench.tools.pd_capture_start(stop_on="contract")["path"]
     assert bench.tools.pd_capture_wait(timeout_s=10)["reason"] == "contract"
     errors = [r for r in records(path) if r["type"] == "error"]
@@ -170,7 +170,7 @@ def test_corrupt_putdata_is_recorded_and_capture_continues(bench_factory):
 
 
 def test_repeated_protocol_errors_end_the_capture_with_a_footer(bench_factory):
-    bench = bench_factory([S3[0]] + [CORRUPT_PUTDATA] * MAX_CONSECUTIVE_PROTOCOL_ERRORS)
+    bench = bench_factory([POLL_15MS[0]] + [CORRUPT_PUTDATA] * MAX_CONSECUTIVE_PROTOCOL_ERRORS)
     path = bench.tools.pd_capture_start()["path"]
     summary = bench.tools.pd_capture_wait(timeout_s=5)
     assert summary["reason"] == "error"
@@ -181,8 +181,8 @@ def test_repeated_protocol_errors_end_the_capture_with_a_footer(bench_factory):
 
 
 def test_whole_negotiation_in_one_poll(bench_factory):
-    from capture_bench import S4
-    bench = bench_factory(S4)
+    from capture_bench import POLL_1000MS
+    bench = bench_factory(POLL_1000MS)
     path = bench.tools.pd_capture_start(stop_on="contract")["path"]
     assert bench.tools.pd_capture_wait(timeout_s=10)["reason"] == "contract"
     assert [r["msg"] for r in non_goodcrc(records(path))] == [
@@ -190,14 +190,14 @@ def test_whole_negotiation_in_one_poll(bench_factory):
 
 
 def test_default_path_uses_capture_dir_and_label(bench_factory, capture_dir):
-    bench = bench_factory(S3)
+    bench = bench_factory(POLL_15MS)
     path = bench.tools.pd_capture_start(label="cold attach #1")["path"]
     bench.tools.pd_capture_stop()
     assert path.startswith(str(capture_dir.resolve())) and path.endswith("-cold-attach-1.jsonl")
 
 
 def test_bad_options_return_errors_without_claiming(bench_factory):
-    bench = bench_factory(S3)
+    bench = bench_factory(POLL_15MS)
     assert bench.tools.pd_capture_start(stop_on="never")["kind"] == "ValueError"
     assert bench.tools.pd_capture_start(timeout_s=0)["kind"] == "ValueError"
     assert bench.meters == []
@@ -206,7 +206,7 @@ def test_bad_options_return_errors_without_claiming(bench_factory):
 def test_existing_file_is_not_overwritten(bench_factory, tmp_path):
     target = tmp_path / "keep.jsonl"
     target.write_text("precious\n")
-    bench = bench_factory(S3)
+    bench = bench_factory(POLL_15MS)
     assert bench.tools.pd_capture_start(path=str(target))["kind"] == "FileExistsError"
     assert target.read_text() == "precious\n" and bench.meters == []
 
@@ -254,7 +254,7 @@ def test_pd_status_returns_protocol_error_result():
 
 def test_capture_survives_poll_timing(bench_factory):
     # A slow reader of the file sees whole records while the capture writes.
-    bench = bench_factory(S3)
+    bench = bench_factory(POLL_15MS)
     path = bench.tools.pd_capture_start()["path"]
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline and bench.meters[0].pd_polls < 50:
@@ -265,8 +265,8 @@ def test_capture_survives_poll_timing(bench_factory):
 
 
 def test_repeated_corrupt_pd_payloads_end_the_capture(bench_factory):
-    corrupt = S3[0] + bytes.fromhex("8300")  # a truncated event header after the status
-    bench = bench_factory([S3[0]] + [corrupt] * MAX_CONSECUTIVE_PROTOCOL_ERRORS)
+    corrupt = POLL_15MS[0] + bytes.fromhex("8300")  # a truncated event header after the status
+    bench = bench_factory([POLL_15MS[0]] + [corrupt] * MAX_CONSECUTIVE_PROTOCOL_ERRORS)
     path = bench.tools.pd_capture_start()["path"]
     assert bench.tools.pd_capture_wait(timeout_s=5)["reason"] == "error"
     recs = records(path)
@@ -278,8 +278,8 @@ def test_repeated_corrupt_pd_payloads_end_the_capture(bench_factory):
 
 
 def test_a_good_poll_resets_the_pd_error_count(bench_factory):
-    corrupt = S3[0] + bytes.fromhex("8300")
-    payloads = [S3[0]] + [corrupt] * (MAX_CONSECUTIVE_PROTOCOL_ERRORS - 1) + [S3[1]] \
+    corrupt = POLL_15MS[0] + bytes.fromhex("8300")
+    payloads = [POLL_15MS[0]] + [corrupt] * (MAX_CONSECUTIVE_PROTOCOL_ERRORS - 1) + [POLL_15MS[1]] \
         + [corrupt] * (MAX_CONSECUTIVE_PROTOCOL_ERRORS - 1)
     bench = bench_factory(payloads)
     bench.tools.pd_capture_start()
@@ -293,7 +293,7 @@ def test_a_good_poll_resets_the_pd_error_count(bench_factory):
 
 @pytest.mark.parametrize("timeout_s", [float("inf"), 1e300, float("nan"), -5])
 def test_wait_clamps_its_timeout(bench_factory, timeout_s):
-    bench = bench_factory(S3)
+    bench = bench_factory(POLL_15MS)
     bench.tools.pd_capture_start(timeout_s=0.2)
     out = bench.tools.pd_capture_wait(timeout_s=timeout_s)
     assert "error" not in out
@@ -305,7 +305,7 @@ def test_wait_clamps_its_timeout(bench_factory, timeout_s):
 def test_stop_and_wait_results_stay_within_the_summary_bound(bench_factory):
     import json as _json
     from km003c_mcp.capture_read import SUMMARY_MAX_BYTES
-    bench = bench_factory(S3)
+    bench = bench_factory(POLL_15MS)
     bench.tools.pd_capture_start(label="x" * 3000, stop_after_messages=8)
     waited = bench.tools.pd_capture_wait(timeout_s=10)
     stopped = bench.tools.pd_capture_stop()

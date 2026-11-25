@@ -342,7 +342,7 @@ KM003C_HW=1 uv run --extra dev pytest tests/test_hw.py
 
 Hardware tests that need a person to plug cables, such as the cold attach that checks a
 capture stops on `contract`, also need `KM003C_HW_INTERACTIVE=1`; they prompt on the
-terminal. `tests/fixtures/s3_golden.jsonl` is the capture the fake meter produces from real
+terminal. `tests/fixtures/golden_15ms.jsonl` is the capture the fake meter produces from real
 firmware 2.0.0 payloads; after a deliberate format change, regenerate it with
 `KM003C_UPDATE_GOLDEN=1` and review the diff.
 

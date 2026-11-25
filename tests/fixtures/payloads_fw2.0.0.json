@@ -1,7 +1,7 @@
 {
-"source": "Phase 1 spike, KM003C serial 000000, firmware 2.0.0, Apple 140 W charger into a USB PD sink board; raw PdPacket attribute payloads, one per GetData poll, in order",
-"s3": {
-"note": "S3, 15 ms poll, polls 960 to 1190 of 1288 (cold attach, negotiation, Discover Identity)",
+"source": "Reference captures from a KM003C (serial replaced by 000000), firmware 2.0.0, hardware 2.3, Apple 140 W charger into a USB PD sink board; raw PdPacket attribute payloads, one per GetData poll, in order",
+"poll_15ms": {
+"note": "15 ms poll, polls 960 to 1190 of 1288 (cold attach, negotiation, Discover Identity)",
 "payloads": [
 "ac56df0000000000e50be30b",
 "bf56df0002000000eb0be90b",
@@ -236,8 +236,8 @@
 "5767df001d50c9fe10060000"
 ]
 },
-"s4": {
-"note": "S4, 1000 ms poll, all 20 polls (the whole negotiation arrives in one poll)",
+"poll_1000ms": {
+"note": "1000 ms poll, all 20 polls (the whole negotiation arrives in one poll)",
 "payloads": [
 "91f2e100070000004b001c00",
 "7ef6e100060000004e001f00",

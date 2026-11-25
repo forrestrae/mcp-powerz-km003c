@@ -15,10 +15,10 @@ SERVER = f"""
 import os, sys, time
 sys.path.insert(0, {TESTS!r})
 os.environ["KM003C_PD_POLL_MS"] = "1"
-from capture_bench import S3
+from capture_bench import POLL_15MS
 from fakes import MeterFake
 from km003c_mcp.server import Km003cService, build_tools, install_sigterm_handler
-service = Km003cService(transport_factory=lambda: MeterFake(pd_payloads=S3), idle_release_s=0)
+service = Km003cService(transport_factory=lambda: MeterFake(pd_payloads=POLL_15MS), idle_release_s=0)
 tools = build_tools(service, enable_trigger=False)
 assert tools.pd_capture_start(path=sys.argv[1])["started"]
 install_sigterm_handler(service)
@@ -31,13 +31,13 @@ RECORD = f"""
 import os, sys
 sys.path.insert(0, {TESTS!r})
 os.environ["KM003C_PD_POLL_MS"] = "1"
-from capture_bench import S3
+from capture_bench import POLL_15MS
 from fakes import MeterFake
 import km003c_mcp.server as srv
 from km003c_mcp.cli import main
 real = srv.Km003cService
 srv.Km003cService = lambda **kw: real(
-    transport_factory=lambda: MeterFake(pd_payloads=S3), **kw)
+    transport_factory=lambda: MeterFake(pd_payloads=POLL_15MS), **kw)
 sys.exit(main(["record", "--timeout", "60", sys.argv[1]]))
 """
 
