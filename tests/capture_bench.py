@@ -1,4 +1,4 @@
-"""Helpers for the capture tests: the Phase 1 spike payloads and a service on MeterFake."""
+"""Helpers for the capture tests: the reference PdPacket payloads and a service on MeterFake."""
 
 import json
 from pathlib import Path
@@ -9,17 +9,17 @@ from km003c_mcp.server import Km003cService, build_tools
 FIXTURES = Path(__file__).parent / "fixtures"
 # Raw PdPacket payloads from a KM003C on firmware 2.0.0: an Apple 140 W charger attached to a
 # USB PD sink, one payload per GetData poll.
-SPIKE = json.loads((FIXTURES / "spike_fw2.0.0.json").read_text())
-S3 = [bytes.fromhex(p) for p in SPIKE["s3"]["payloads"]]
-S4 = [bytes.fromhex(p) for p in SPIKE["s4"]["payloads"]]
-GOLDEN = FIXTURES / "s3_golden.jsonl"
+REFERENCE = json.loads((FIXTURES / "payloads_fw2.0.0.json").read_text())
+POLL_15MS = [bytes.fromhex(p) for p in REFERENCE["poll_15ms"]["payloads"]]
+POLL_1000MS = [bytes.fromhex(p) for p in REFERENCE["poll_1000ms"]["payloads"]]
+GOLDEN = FIXTURES / "golden_15ms.jsonl"
 
 
-def s3_until(marker: str) -> list[bytes]:
-    """The S3 payloads up to and including the first one whose hex contains ``marker``."""
-    for k, p in enumerate(S3):
+def poll_15ms_until(marker: str) -> list[bytes]:
+    """The 15 ms payloads up to and including the first one whose hex contains ``marker``."""
+    for k, p in enumerate(POLL_15MS):
         if marker in p.hex():
-            return S3[:k + 1]
+            return POLL_15MS[:k + 1]
     raise ValueError(marker)
 
 

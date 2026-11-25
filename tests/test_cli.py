@@ -5,7 +5,7 @@ import subprocess
 import sys
 
 import km003c_mcp.server as srv
-from capture_bench import GOLDEN, S3, records
+from capture_bench import GOLDEN, POLL_15MS, records
 from fakes import MeterFake
 from km003c_mcp.cli import main
 
@@ -51,7 +51,7 @@ def test_record_announces_the_path_and_stops_on_contract(monkeypatch, tmp_path, 
     monkeypatch.setenv("KM003C_PD_POLL_MS", "1")
     real = srv.Km003cService
     monkeypatch.setattr(srv, "Km003cService", lambda **kw: real(
-        transport_factory=lambda: MeterFake(serial_number="000000", pd_payloads=S3), **kw))
+        transport_factory=lambda: MeterFake(serial_number="000000", pd_payloads=POLL_15MS), **kw))
     path = tmp_path / "cold.jsonl"
     code = main(["record", "--stop-on", "contract", "--timeout", "20", "--label", "cold",
                  "--provenance", '{"charger": "Apple 140 W"}', str(path)])
@@ -65,10 +65,10 @@ def test_record_announces_the_path_and_stops_on_contract(monkeypatch, tmp_path, 
 
 
 def test_record_exits_3_when_the_condition_is_not_met(monkeypatch, tmp_path, capsys):
-    from capture_bench import s3_until
+    from capture_bench import poll_15ms_until
     monkeypatch.setenv("KM003C_PD_POLL_MS", "1")
     real = srv.Km003cService
-    payloads = s3_until("82102cb18441")  # ends before Accept and PS_RDY
+    payloads = poll_15ms_until("82102cb18441")  # ends before Accept and PS_RDY
     monkeypatch.setattr(srv, "Km003cService", lambda **kw: real(
         transport_factory=lambda: MeterFake(pd_payloads=payloads), **kw))
     code = main(["record", "--stop-on", "contract", "--timeout", "0.3",
