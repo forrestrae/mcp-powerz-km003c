@@ -52,7 +52,7 @@ def test_golden_header_and_footer():
     recs = records(GOLDEN)
     header, footer = recs[0], recs[-1]
     assert header["format"] == "km003c-capture" and header["version"] == 1
-    assert header["meter"] == {"serial": "053893", "fw_version": "2.0.0", "hw_version": "2.3",
+    assert header["meter"] == {"serial": "000000", "fw_version": "2.0.0", "hw_version": "2.3",
                                "model": "KM003C"}
     assert header["pd_monitor"]["enabled"] is True and header["pd_monitor"]["attempts"] == 1
     assert footer["type"] == "footer" and footer["reason"] == "messages"
@@ -310,6 +310,7 @@ def test_stop_and_wait_results_stay_within_the_summary_bound(bench_factory):
     waited = bench.tools.pd_capture_wait(timeout_s=10)
     stopped = bench.tools.pd_capture_stop()
     for out in (waited, stopped):
-        assert len(_json.dumps(out, separators=(",", ":"))) <= SUMMARY_MAX_BYTES
+        whole = len(_json.dumps(out, separators=(",", ":")))
+        assert whole - len(_json.dumps(out["path"])) <= SUMMARY_MAX_BYTES
         assert "running" in out
     assert stopped["stopped"] is False

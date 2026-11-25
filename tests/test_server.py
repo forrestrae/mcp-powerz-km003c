@@ -234,7 +234,7 @@ def test_reopen_after_reset_skips_the_holder_lookup(monkeypatch):
         return transports.pop(0)
     tools, _ = make_tools(factory=factory)
     assert "vbus_v" in tools.measure()
-    assert lookups[0] is None and lookups[1] is not None and lookups[1]("053893") is None
+    assert lookups[0] is None and lookups[1] is not None and lookups[1]("000000") is None
 
 
 def registered_tools(enable_trigger=None):

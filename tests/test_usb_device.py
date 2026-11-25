@@ -322,7 +322,7 @@ ENODEV = usb.core.USBError("No such device (it may have been disconnected)", err
 
 def test_busy_error_names_the_holder(monkeypatch, disposed):
     # macOS reports a held interface as errno 19; ioreg names the process holding it.
-    stub = StubUsb("053893", fail=ENODEV)
+    stub = StubUsb("000000", fail=ENODEV)
     monkeypatch.setattr(ud, "_find_devices", lambda: [stub])
     asked = []
 
@@ -333,8 +333,8 @@ def test_busy_error_names_the_holder(monkeypatch, disposed):
     with pytest.raises(DeviceBusyError) as info:
         PyUsbTransport.open(holder_lookup=lookup)
     msg = str(info.value)
-    assert asked == ["053893"]
-    assert msg.startswith("the KM003C 053893 is held by another process (pid 46945, python3.14)")
+    assert asked == ["000000"]
+    assert msg.startswith("the KM003C 000000 is held by another process (pid 46945, python3.14)")
     assert "No such device" in msg
     assert "km003c MCP server" in msg and "POWER-Z PC software" in msg and "script" in msg
     assert isinstance(info.value.__cause__, usb.core.USBError)
@@ -342,7 +342,7 @@ def test_busy_error_names_the_holder(monkeypatch, disposed):
 
 
 def test_busy_error_names_this_process_when_it_holds_the_meter(monkeypatch, disposed):
-    monkeypatch.setattr(ud, "_find_devices", lambda: [StubUsb("053893", fail=ENODEV)])
+    monkeypatch.setattr(ud, "_find_devices", lambda: [StubUsb("000000", fail=ENODEV)])
     me = f"pid {ud.os.getpid()}, python3.14"
     with pytest.raises(DeviceBusyError) as info:
         PyUsbTransport.open(holder_lookup=lambda serial: me)
@@ -377,11 +377,11 @@ def test_other_claim_errors_are_busy_without_a_holder_lookup(monkeypatch, dispos
 
 
 def test_busy_error_without_a_holder(monkeypatch, disposed):
-    monkeypatch.setattr(ud, "_find_devices", lambda: [StubUsb("053893", fail=ENODEV)])
+    monkeypatch.setattr(ud, "_find_devices", lambda: [StubUsb("000000", fail=ENODEV)])
     with pytest.raises(DeviceBusyError) as info:
         PyUsbTransport.open(holder_lookup=lambda serial: None)
     msg = str(info.value)
-    assert msg.startswith("the KM003C 053893 is held by another process: ")
+    assert msg.startswith("the KM003C 000000 is held by another process: ")
     assert "pid" not in msg and "Likely holders" in msg
 
 
@@ -409,10 +409,10 @@ IOREG = """\
   | +-o POWER-Z KM003C@20110000  <class IOUSBHostDevice, id 0x100006043, registered>
   | | {
   | |   "idProduct" = 99
-  | |   "kUSBSerialNumberString" = "053893"
+  | |   "kUSBSerialNumberString" = "000000"
   | |   "UsbExclusiveOwner" = "pid 46945, python3.14"
   | |   "idVendor" = 24521
-  | |   "USB Serial Number" = "053893"
+  | |   "USB Serial Number" = "000000"
   | | }
   | |   +-o APP@0  <class IOUSBHostInterface, id 0x100006049, registered, matched>
   | |   | {
@@ -420,7 +420,7 @@ IOREG = """\
   | |   |   "UsbExclusiveOwner" = "pid 46945, python3.14"
   | |   |   "bInterfaceNumber" = 0
   | |   |   "idVendor" = 24521
-  | |   |   "USB Serial Number" = "053893"
+  | |   |   "USB Serial Number" = "000000"
   | |   | }
   | |   +-o APP@1  <class IOUSBHostInterface, id 0x10000604d, registered, matched>
   | |   | {
@@ -428,14 +428,14 @@ IOREG = """\
   | |   |   "UsbExclusiveOwner" = "AppleUSBACMControl"
   | |   |   "bInterfaceNumber" = 1
   | |   |   "idVendor" = 24521
-  | |   |   "USB Serial Number" = "053893"
+  | |   |   "USB Serial Number" = "000000"
   | |   | }
 """
 
 
 def test_parse_exclusive_owner_reads_interface_zero():
     assert ud.parse_exclusive_owner(IOREG) == "pid 46945, python3.14"
-    assert ud.parse_exclusive_owner(IOREG, "053893") == "pid 46945, python3.14"
+    assert ud.parse_exclusive_owner(IOREG, "000000") == "pid 46945, python3.14"
 
 
 def test_parse_exclusive_owner_other_serial_or_free_meter():

@@ -53,7 +53,7 @@ class CaptureBench:
         self.tools = build_tools(self.service, enable_trigger=False)
 
     def _open(self):
-        meter = MeterFake(serial_number="053893", pd_payloads=self.payloads)
+        meter = MeterFake(serial_number="000000", pd_payloads=self.payloads)
         self.meters.append(meter)
         return meter
 

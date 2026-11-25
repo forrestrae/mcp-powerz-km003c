@@ -44,7 +44,7 @@ def test_summary_of_the_golden_capture():
     assert s["contract"] == {"t_ps_rdy": 14637780, "rdo": "4184b12c", "pdo": "000641d6",
                              "text": "pos 4, 3.0 A of 20.0 V 4.7 A"}
     assert s["warnings"] == []
-    assert size(s) <= cr.SUMMARY_MAX_BYTES
+    assert size(s) - size(s["path"]) <= cr.SUMMARY_MAX_BYTES
 
 
 def _write(tmp_path, records_, name="c.jsonl"):
@@ -63,7 +63,7 @@ def test_summary_is_bounded_and_says_so(tmp_path):
                  + bytes([0x80 | (len(caps) + 5)]) + struct.pack("<I", t) + b"\x00" + caps)
     s.finish("manual")
     out = cr.read(tmp_path / "big.jsonl")
-    assert out["truncated"] is True and size(out) <= cr.SUMMARY_MAX_BYTES
+    assert out["truncated"] is True and size(out) - size(out["path"]) <= cr.SUMMARY_MAX_BYTES
     marker = next(line for line in out["lines"] if line.startswith("..."))
     assert "lines omitted" in marker and "mode=messages" in marker
     assert out["lines"][0].startswith("t=1000 ") and out["lines"][-1].startswith("t=3990 ")
@@ -93,7 +93,7 @@ def test_sanity_rule_only_connection_events(tmp_path):
         {"type": "footer", "reason": "timeout"},
     ])
     warnings = cr.read(path)["warnings"]
-    assert any("PD monitoring was not active" in w and "already enabled or refused" in w
+    assert any("no PD traffic" in w and "PD monitoring not active" in w and "already enabled or refused" in w
                for w in warnings)
 
 
@@ -416,11 +416,25 @@ def test_summary_bound_holds_with_oversized_fields(tmp_path, body):
     path = _oversized(tmp_path, body)
     extra = {"running": False, "stopped": True}
     out = cr.read(path, "summary", extra=extra)
-    assert size(out) <= cr.SUMMARY_MAX_BYTES and out["truncated"] is bool(body)
+    assert size(out) - size(out["path"]) <= cr.SUMMARY_MAX_BYTES
+    assert out["truncated"] is bool(body)
     assert out["stopped"] is True and out["running"] is False
-    assert out["path"].endswith(".jsonl") and out["path"].startswith("...")
+    assert out["path"] == str(path.resolve())
     assert "more chars" in out["label"] and "more chars" in out["meter_fw"]
     assert len(out["warnings"]) <= cr.SUMMARY_MAX_WARNINGS
+
+
+def test_summary_keeps_a_long_path_whole(tmp_path):
+    # A checkout or capture directory can be deeper than 200 characters; a shortened path
+    # cannot be used to read the file again.
+    deep = tmp_path
+    for k in range(4):
+        deep = deep / ("d" * 60 + str(k))
+    deep.mkdir(parents=True)
+    path = _write(deep, [HEADER, _pd(0, 1000, CAPS)])
+    assert len(str(path.resolve())) > 200
+    for out in (cr.read(path, "summary"), cr.summary(cr.load_capture(path), max_bytes=300)):
+        assert out["path"] == str(path.resolve())
 
 
 def test_summary_with_no_lines_is_not_truncated():
