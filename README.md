@@ -109,6 +109,33 @@ These rules cover tool calls only. `pd_capture_start` and `stream_start` write f
 the path the caller passes, and the server process writes them itself, outside Claude
 Code's file permission rules.
 
+## Register with Codex
+
+`codex mcp add` writes the server to `~/.codex/config.toml` as `[mcp_servers.km003c]`, so
+one registration serves every project. In both commands, `<repo>` is the absolute path of
+the clone.
+
+### Windows
+
+```powershell
+codex mcp add km003c -- <repo>\.venv\Scripts\km003c-mcp.exe
+```
+
+### macOS and Linux
+
+```bash
+codex mcp add km003c -- uv --directory <repo> run km003c-mcp
+```
+
+On either platform, confirm the registration. The output lists `km003c` with its command:
+
+```bash
+codex mcp list
+```
+
+To set one of the variables from the configuration table below, pass `--env` before the
+server name, once per variable, for example `--env KM003C_CAPTURE_DIR=<directory>`.
+
 ## Sharing the meter with other programs
 
 Close the ChargerLab POWER-Z PC software before using the server: only one program can
