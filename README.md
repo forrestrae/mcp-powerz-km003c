@@ -61,6 +61,54 @@ claude mcp add km003c -- <repo>\.venv\Scripts\km003c-mcp.exe
 claude mcp add km003c -- uv --directory <repo> run km003c-mcp
 ```
 
+## Allow the tools in Claude Code
+
+Registration makes the tools available, but Claude Code still asks for approval on each
+tool call until a permission rule allows it. Add the rules to the repository where Claude
+Code runs, which is the project that uses the meter and not necessarily this clone. The
+steps are the same on every platform.
+
+1. Choose the file. `.claude/settings.json` is checked in and applies to everyone who
+   works in the repository. `.claude/settings.local.json` applies to one person and stays
+   out of version control.
+2. Add the tools to `permissions.allow` in that file, merging with any rules already
+   there. Each rule is `mcp__<server>__<tool>`, where `<server>` is the name given to
+   `claude mcp add`, `km003c` in the commands above.
+
+    ```json
+    {
+      "permissions": {
+        "allow": [
+          "mcp__km003c__device_info",
+          "mcp__km003c__measure",
+          "mcp__km003c__pd_status",
+          "mcp__km003c__stream_start",
+          "mcp__km003c__stream_status",
+          "mcp__km003c__stream_samples",
+          "mcp__km003c__stream_stop",
+          "mcp__km003c__pd_capture_start",
+          "mcp__km003c__pd_capture_wait",
+          "mcp__km003c__pd_capture_mark",
+          "mcp__km003c__pd_capture_stop",
+          "mcp__km003c__pd_capture_read",
+          "mcp__km003c__device_release"
+        ]
+      }
+    }
+    ```
+
+3. Start a new Claude Code session in that repository. The listed tools now run without
+   an approval prompt.
+
+The list leaves out the `trigger_*` tools on purpose. They can make a charger change VBUS,
+so with `KM003C_ENABLE_TRIGGER=1` set and no rule for them, Claude Code asks before each
+trigger call. The shorter rule `mcp__km003c__*` allows every tool of the server, the
+trigger tools included, so use it only where unprompted trigger calls are acceptable.
+
+These rules cover tool calls only. `pd_capture_start` and `stream_start` write files at
+the path the caller passes, and the server process writes them itself, outside Claude
+Code's file permission rules.
+
 ## Sharing the meter with other programs
 
 Close the ChargerLab POWER-Z PC software before using the server: only one program can
