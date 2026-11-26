@@ -91,9 +91,10 @@ steps are the same on every platform.
 1. Choose the file. `.claude/settings.json` is checked in and applies to everyone who
    works in the repository. `.claude/settings.local.json` applies to one person and stays
    out of version control.
-2. Add the tools to `permissions.allow` in that file, merging with any rules already
-   there. Each rule is `mcp__<server>__<tool>`, where `<server>` is the name given to
-   `claude mcp add`, `km003c` in the commands above.
+2. Add both lists to `permissions` in that file, merging with any rules already there.
+   `allow` runs a tool without asking, and `ask` always asks first. Each rule is
+   `mcp__<server>__<tool>`, where `<server>` is the name given to `claude mcp add`,
+   `km003c` in the commands above.
 
     ```json
     {
@@ -112,18 +113,30 @@ steps are the same on every platform.
           "mcp__km003c__pd_capture_stop",
           "mcp__km003c__pd_capture_read",
           "mcp__km003c__device_release"
+        ],
+        "ask": [
+          "mcp__km003c__trigger_detect",
+          "mcp__km003c__trigger_enter",
+          "mcp__km003c__trigger_pd_source_caps",
+          "mcp__km003c__trigger_pd_request",
+          "mcp__km003c__trigger_fast_charge",
+          "mcp__km003c__trigger_reset",
+          "mcp__km003c__trigger_close",
+          "mcp__km003c__trigger_raw"
         ]
       }
     }
     ```
 
-3. Start a new Claude Code session in that repository. The listed tools now run without
-   an approval prompt.
+3. Start a new Claude Code session in that repository. The 13 measurement, stream,
+   capture, and release tools now run without an approval prompt. Claude Code asks before
+   each trigger call.
 
-The list leaves out the `trigger_*` tools on purpose. They can make a charger change VBUS,
-so with `KM003C_ENABLE_TRIGGER=1` set and no rule for them, Claude Code asks before each
-trigger call. The shorter rule `mcp__km003c__*` allows every tool of the server, the
-trigger tools included, so use it only where unprompted trigger calls are acceptable.
+The `trigger_*` tools are in `ask` because they can make a charger change VBUS. They are
+registered only with `KM003C_ENABLE_TRIGGER=1`, and Claude Code would ask for them without
+any rule. The explicit rules keep it asking when a broader rule would allow them: an `ask`
+rule takes precedence over an `allow` rule, so a rule such as `mcp__km003c__*` added
+elsewhere does not silence the prompt.
 
 These rules cover tool calls only. `pd_capture_start` and `stream_start` write files at
 the path the caller passes, and the server process writes them itself, outside Claude
@@ -181,7 +194,7 @@ the configuration approves the tool. The steps are the same on every platform.
 1. Open `~/.codex/config.toml`, the file `codex mcp add` wrote the registration to. On
    Windows it is `%USERPROFILE%\.codex\config.toml`.
 2. Add this table below the `[mcp_servers.km003c]` entry. `approve` runs the tool without
-   asking.
+   asking, and `prompt` always asks first.
 
     ```toml
     [mcp_servers.km003c.tools]
@@ -198,16 +211,25 @@ the configuration approves the tool. The steps are the same on every platform.
     pd_capture_stop = { approval_mode = "approve" }
     pd_capture_read = { approval_mode = "approve" }
     device_release = { approval_mode = "approve" }
+    trigger_detect = { approval_mode = "prompt" }
+    trigger_enter = { approval_mode = "prompt" }
+    trigger_pd_source_caps = { approval_mode = "prompt" }
+    trigger_pd_request = { approval_mode = "prompt" }
+    trigger_fast_charge = { approval_mode = "prompt" }
+    trigger_reset = { approval_mode = "prompt" }
+    trigger_close = { approval_mode = "prompt" }
+    trigger_raw = { approval_mode = "prompt" }
     ```
 
-3. Start a new Codex session. The listed tools now run without an approval prompt.
+3. Start a new Codex session. The 13 measurement, stream, capture, and release tools now
+   run without an approval prompt. Codex asks before each trigger call.
 
-As in the Claude Code list, the `trigger_*` tools are left out so that Codex keeps asking
-before each trigger call. Setting `default_tools_approval_mode = "approve"` in
-`[mcp_servers.km003c]` approves every tool of the server, the trigger tools included, so
-use it only where unprompted trigger calls are acceptable. The other modes are `prompt`,
-which always asks, and `writes`, which asks for every tool not marked read-only and so
-asks for all of this server's tools.
+As in the Claude Code lists, the `trigger_*` tools are set to `prompt` because they can
+make a charger change VBUS. Codex would ask for them without an entry, and the explicit
+entries keep it asking when the server's default changes: a per-tool `approval_mode`
+overrides `default_tools_approval_mode`, so setting that key to `approve` in
+`[mcp_servers.km003c]` does not silence the prompt. The remaining mode, `writes`, asks for
+every tool not marked read-only and so asks for all of this server's tools.
 
 ## Sharing the meter with other programs
 
