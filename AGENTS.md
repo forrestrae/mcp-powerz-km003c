@@ -55,6 +55,16 @@ scripts/setup_hooks.sh
 
 Agents never push. The `pre-push` hook refuses every push when `CLAUDECODE`, `CODEX_THREAD_ID`, `CODEX_SESSION_ID`, `CODEX_TOOL_CALL_ID`, `CODEX_SANDBOX`, or `WORKFLOW_AGENT=1` is set. Agents also do not tag, bypass hooks with `--no-verify`, or change the hook configuration.
 
+### Releases and the version
+
+The package version is not written in `pyproject.toml`. `hatch-vcs` reads it from git when the package is built, so the tag is the only place a release number exists and no version-bump commit is needed.
+
+- A build of the commit a `vX.Y.Z` tag points at reports `X.Y.Z`.
+- A build of a later commit reports the next patch version with a development suffix, such as `0.2.2.dev3+g724c1c3`. A dirty tree adds the date.
+- A clone keeps the version from its last `uv sync`. Run `uv sync --extra dev` again after a new tag or commit to refresh it.
+
+The server writes this version into the header of every capture file, so capture a release measurement from a tagged build.
+
 ### Merging an upstream branch
 
 An `upstream/<topic>` branch is never rebased onto `main`, because that would carry the fork's workflow commits into the pull-request head. It also lacks `scripts/verify.sh` and the fork's ruff configuration, since both exist only on `main`. Verify it in two stages instead:

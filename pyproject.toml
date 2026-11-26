@@ -1,10 +1,11 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "km003c-mcp"
-version = "0.2.1"
+# The version comes from the newest `vX.Y.Z` git tag; see [tool.hatch.version].
+dynamic = ["version"]
 description = "MCP server for the ChargerLab POWER-Z KM003C USB-C power meter"
 readme = "README.md"
 license = "MIT"
@@ -24,6 +25,12 @@ dev = ["pytest>=8", "ruff>=0.6"]
 [project.scripts]
 km003c-mcp = "km003c_mcp.server:main"
 km003c-capture = "km003c_mcp.cli:main"
+
+[tool.hatch.version]
+# hatch-vcs reads the version from git at build time. A tagged commit gets the tag's
+# version, such as 0.2.1. A later commit gets the next patch version with a development
+# suffix that names the commit, such as 0.2.2.dev3+g724c1c3.
+source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/km003c_mcp"]
