@@ -52,7 +52,7 @@ pyusb's normal search.
 ## Register with Claude Code
 
 Register the server from a GitHub release to use it, or from a clone to run a working
-copy. In the clone commands, `<repo>` is the absolute path of the clone.
+copy. In the clone commands, `<clone-path>` is the absolute path of the clone.
 
 ### From GitHub, pinned to a release
 
@@ -61,24 +61,29 @@ This command is the same on Windows, macOS, and Linux and needs no clone. It nee
 environment on first start and reuses it afterwards.
 
 ```bash
-claude mcp add km003c -- uvx --from git+https://github.com/forrestrae/mcp-powerz-km003c@v0.2.1 km003c-mcp
+claude mcp add km003c -- uvx --from git+<repository-url>@<tag> km003c-mcp
 ```
 
-Replace `v0.2.1` with the release to run; the
-[tags page](https://github.com/forrestrae/mcp-powerz-km003c/tags) lists them. The server
-stays on that release until the registration is changed. To move to another release,
-remove the entry with `claude mcp remove km003c` and add it again with the new tag.
+Replace the two placeholders before running the command:
+
+- `<repository-url>` is the HTTPS URL of the GitHub repository to install from, as shown
+  in the browser's address bar on the repository's main page.
+- `<tag>` is the release to run, a tag of the form `vX.Y.Z`. The repository's Tags page
+  lists them; the newest is the latest release.
+
+The server stays on that release until the registration is changed. To move to another
+release, remove the entry with `claude mcp remove km003c` and add it again with the new tag.
 
 ### From a clone on Windows
 
 ```powershell
-claude mcp add km003c -- <repo>\.venv\Scripts\km003c-mcp.exe
+claude mcp add km003c -- <clone-path>\.venv\Scripts\km003c-mcp.exe
 ```
 
 ### From a clone on macOS and Linux
 
 ```bash
-claude mcp add km003c -- uv --directory <repo> run km003c-mcp
+claude mcp add km003c -- uv --directory <clone-path> run km003c-mcp
 ```
 
 ## Allow the tools in Claude Code
@@ -145,7 +150,7 @@ Code's file permission rules.
 ## Register with Codex
 
 `codex mcp add` writes the server to `~/.codex/config.toml` as `[mcp_servers.km003c]`, so
-one registration serves every project. In the clone commands, `<repo>` is the absolute
+one registration serves every project. In the clone commands, `<clone-path>` is the absolute
 path of the clone.
 
 ### From GitHub, pinned to a release
@@ -155,24 +160,29 @@ This command is the same on Windows, macOS, and Linux and needs no clone. It nee
 environment on first start and reuses it afterwards.
 
 ```bash
-codex mcp add km003c -- uvx --from git+https://github.com/forrestrae/mcp-powerz-km003c@v0.2.1 km003c-mcp
+codex mcp add km003c -- uvx --from git+<repository-url>@<tag> km003c-mcp
 ```
 
-Replace `v0.2.1` with the release to run; the
-[tags page](https://github.com/forrestrae/mcp-powerz-km003c/tags) lists them. The server
-stays on that release until the registration is changed. To move to another release,
-remove the entry with `codex mcp remove km003c` and add it again with the new tag.
+Replace the two placeholders before running the command:
+
+- `<repository-url>` is the HTTPS URL of the GitHub repository to install from, as shown
+  in the browser's address bar on the repository's main page.
+- `<tag>` is the release to run, a tag of the form `vX.Y.Z`. The repository's Tags page
+  lists them; the newest is the latest release.
+
+The server stays on that release until the registration is changed. To move to another
+release, remove the entry with `codex mcp remove km003c` and add it again with the new tag.
 
 ### From a clone on Windows
 
 ```powershell
-codex mcp add km003c -- <repo>\.venv\Scripts\km003c-mcp.exe
+codex mcp add km003c -- <clone-path>\.venv\Scripts\km003c-mcp.exe
 ```
 
 ### From a clone on macOS and Linux
 
 ```bash
-codex mcp add km003c -- uv --directory <repo> run km003c-mcp
+codex mcp add km003c -- uv --directory <clone-path> run km003c-mcp
 ```
 
 After any of these commands, confirm the registration. The output lists `km003c` with its command:
