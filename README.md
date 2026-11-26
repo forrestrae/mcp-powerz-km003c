@@ -136,6 +136,44 @@ codex mcp list
 To set one of the variables from the configuration table below, pass `--env` before the
 server name, once per variable, for example `--env KM003C_CAPTURE_DIR=<directory>`.
 
+## Allow the tools in Codex
+
+Codex decides per tool whether to ask for approval. Its default mode, `auto`, asks unless
+the tool's MCP annotations mark it read-only, or mark it as neither destructive nor
+open-world. This server's tools carry no annotations, so Codex asks before each call until
+the configuration approves the tool. The steps are the same on every platform.
+
+1. Open `~/.codex/config.toml`, the file `codex mcp add` wrote the registration to. On
+   Windows it is `%USERPROFILE%\.codex\config.toml`.
+2. Add this table below the `[mcp_servers.km003c]` entry. `approve` runs the tool without
+   asking.
+
+    ```toml
+    [mcp_servers.km003c.tools]
+    device_info = { approval_mode = "approve" }
+    measure = { approval_mode = "approve" }
+    pd_status = { approval_mode = "approve" }
+    stream_start = { approval_mode = "approve" }
+    stream_status = { approval_mode = "approve" }
+    stream_samples = { approval_mode = "approve" }
+    stream_stop = { approval_mode = "approve" }
+    pd_capture_start = { approval_mode = "approve" }
+    pd_capture_wait = { approval_mode = "approve" }
+    pd_capture_mark = { approval_mode = "approve" }
+    pd_capture_stop = { approval_mode = "approve" }
+    pd_capture_read = { approval_mode = "approve" }
+    device_release = { approval_mode = "approve" }
+    ```
+
+3. Start a new Codex session. The listed tools now run without an approval prompt.
+
+As in the Claude Code list, the `trigger_*` tools are left out so that Codex keeps asking
+before each trigger call. Setting `default_tools_approval_mode = "approve"` in
+`[mcp_servers.km003c]` approves every tool of the server, the trigger tools included, so
+use it only where unprompted trigger calls are acceptable. The other modes are `prompt`,
+which always asks, and `writes`, which asks for every tool not marked read-only and so
+asks for all of this server's tools.
+
 ## Sharing the meter with other programs
 
 Close the ChargerLab POWER-Z PC software before using the server: only one program can
