@@ -1,60 +1,262 @@
 # km003c-mcp
 
-MCP server for the **ChargerLab POWER-Z KM003C** USB-C power meter. It exposes
+MCP server for the ChargerLab POWER-Z KM003C USB-C power meter. It exposes
 measurements, high-rate VBUS/IBUS streaming, USB PD capture with decoding, and the
 meter's fast-charge protocol trigger as MCP tools (stdio transport).
 
 ## Install
 
+The server requires Python 3.11 or later. Each platform section below installs the package
+with its development dependencies into `.venv` in a clone of this repository.
+
+A clone is needed only to develop or test the server. To use a released version, skip to
+the registration sections: they can run the server straight from GitHub. The driver and
+device-access notes below apply to both routes.
+
+### Windows
+
+Run both commands in PowerShell, in the root of the clone:
+
 ```powershell
 python -m venv .venv
+```
+
+```powershell
 .venv\Scripts\pip install -e .[dev]
 ```
 
-Requires Python 3.11+. On Windows the meter's vendor interface already uses the WinUSB
-driver, so no extra driver is needed; `libusb-package` ships the libusb DLL.
+The meter's vendor interface already uses the WinUSB driver, so no extra driver is needed.
+`libusb-package` ships the libusb DLL.
 
-**Close the ChargerLab POWER-Z PC software first** — only one program can hold the
-meter's USB interface. The server reports `DeviceBusyError` otherwise, with the likely
-holders; on macOS it also names the holding process from `ioreg`, for example
+### macOS and Linux
+
+Run this in the root of the clone. It needs [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv sync --extra dev
+```
+
+On macOS, including Apple Silicon, the libusb copy bundled with `libusb-package` works
+without a driver or `sudo`. If it does not load, install Homebrew's libusb
+(`brew install libusb`); pyusb finds `/opt/homebrew/lib/libusb-1.0.dylib` on its own.
+
+On Linux, the user also needs read and write access to the meter's USB device node,
+usually through a udev rule for `5FC9:0063`.
+
+### libusb lookup order
+
+On every platform the server loads libusb-1.0 in this order: the file named by
+`KM003C_LIBUSB`, the copy bundled with `libusb-package`, then the system library through
+pyusb's normal search.
+
+## Register with Claude Code
+
+Register the server from a GitHub release to use it, or from a clone to run a working
+copy. In the clone commands, `<clone-path>` is the absolute path of the clone.
+
+### From GitHub, pinned to a release
+
+This command is the same on Windows, macOS, and Linux and needs no clone. It needs
+[uv](https://docs.astral.sh/uv/) and git. `uvx` builds the tagged release into a cached
+environment on first start and reuses it afterwards.
+
+```bash
+claude mcp add km003c -- uvx --from git+<repository-url>@<tag> km003c-mcp
+```
+
+Replace the two placeholders before running the command:
+
+- `<repository-url>` is the HTTPS URL of the GitHub repository to install from, as shown
+  in the browser's address bar on the repository's main page.
+- `<tag>` is the release to run, a tag of the form `vX.Y.Z`. The repository's Tags page
+  lists them; the newest is the latest release.
+
+The server stays on that release until the registration is changed. To move to another
+release, remove the entry with `claude mcp remove km003c` and add it again with the new tag.
+
+### From a clone on Windows
+
+```powershell
+claude mcp add km003c -- <clone-path>\.venv\Scripts\km003c-mcp.exe
+```
+
+### From a clone on macOS and Linux
+
+```bash
+claude mcp add km003c -- uv --directory <clone-path> run km003c-mcp
+```
+
+## Allow the tools in Claude Code
+
+Registration makes the tools available, but Claude Code still asks for approval on each
+tool call until a permission rule allows it. Add the rules to the repository where Claude
+Code runs, which is the project that uses the meter and not necessarily this clone. The
+steps are the same on every platform.
+
+1. Choose the file. `.claude/settings.json` is checked in and applies to everyone who
+   works in the repository. `.claude/settings.local.json` applies to one person and stays
+   out of version control.
+2. Add both lists to `permissions` in that file, merging with any rules already there.
+   `allow` runs a tool without asking, and `ask` always asks first. Each rule is
+   `mcp__<server>__<tool>`, where `<server>` is the name given to `claude mcp add`,
+   `km003c` in the commands above.
+
+    ```json
+    {
+      "permissions": {
+        "allow": [
+          "mcp__km003c__device_info",
+          "mcp__km003c__measure",
+          "mcp__km003c__pd_status",
+          "mcp__km003c__stream_start",
+          "mcp__km003c__stream_status",
+          "mcp__km003c__stream_samples",
+          "mcp__km003c__stream_stop",
+          "mcp__km003c__pd_capture_start",
+          "mcp__km003c__pd_capture_wait",
+          "mcp__km003c__pd_capture_mark",
+          "mcp__km003c__pd_capture_stop",
+          "mcp__km003c__pd_capture_read",
+          "mcp__km003c__device_release"
+        ],
+        "ask": [
+          "mcp__km003c__trigger_detect",
+          "mcp__km003c__trigger_enter",
+          "mcp__km003c__trigger_pd_source_caps",
+          "mcp__km003c__trigger_pd_request",
+          "mcp__km003c__trigger_fast_charge",
+          "mcp__km003c__trigger_reset",
+          "mcp__km003c__trigger_close",
+          "mcp__km003c__trigger_raw"
+        ]
+      }
+    }
+    ```
+
+3. Start a new Claude Code session in that repository. The 13 measurement, stream,
+   capture, and release tools now run without an approval prompt. Claude Code asks before
+   each trigger call.
+
+The `trigger_*` tools are in `ask` because they can make a charger change VBUS. They are
+registered only with `KM003C_ENABLE_TRIGGER=1`, and Claude Code would ask for them without
+any rule. The explicit rules keep it asking when a broader rule would allow them: an `ask`
+rule takes precedence over an `allow` rule, so a rule such as `mcp__km003c__*` added
+elsewhere does not silence the prompt.
+
+These rules cover tool calls only. `pd_capture_start` and `stream_start` write files at
+the path the caller passes, and the server process writes them itself, outside Claude
+Code's file permission rules.
+
+## Register with Codex
+
+`codex mcp add` writes the server to `~/.codex/config.toml` as `[mcp_servers.km003c]`, so
+one registration serves every project. In the clone commands, `<clone-path>` is the absolute
+path of the clone.
+
+### From GitHub, pinned to a release
+
+This command is the same on Windows, macOS, and Linux and needs no clone. It needs
+[uv](https://docs.astral.sh/uv/) and git. `uvx` builds the tagged release into a cached
+environment on first start and reuses it afterwards.
+
+```bash
+codex mcp add km003c -- uvx --from git+<repository-url>@<tag> km003c-mcp
+```
+
+Replace the two placeholders before running the command:
+
+- `<repository-url>` is the HTTPS URL of the GitHub repository to install from, as shown
+  in the browser's address bar on the repository's main page.
+- `<tag>` is the release to run, a tag of the form `vX.Y.Z`. The repository's Tags page
+  lists them; the newest is the latest release.
+
+The server stays on that release until the registration is changed. To move to another
+release, remove the entry with `codex mcp remove km003c` and add it again with the new tag.
+
+### From a clone on Windows
+
+```powershell
+codex mcp add km003c -- <clone-path>\.venv\Scripts\km003c-mcp.exe
+```
+
+### From a clone on macOS and Linux
+
+```bash
+codex mcp add km003c -- uv --directory <clone-path> run km003c-mcp
+```
+
+After any of these commands, confirm the registration. The output lists `km003c` with its command:
+
+```bash
+codex mcp list
+```
+
+To set one of the variables from the configuration table below, pass `--env` before the
+server name, once per variable, for example `--env KM003C_CAPTURE_DIR=<directory>`.
+
+## Allow the tools in Codex
+
+Codex decides per tool whether to ask for approval. Its default mode, `auto`, asks unless
+the tool's MCP annotations mark it read-only, or mark it as neither destructive nor
+open-world. This server's tools carry no annotations, so Codex asks before each call until
+the configuration approves the tool. The steps are the same on every platform.
+
+1. Open `~/.codex/config.toml`, the file `codex mcp add` wrote the registration to. On
+   Windows it is `%USERPROFILE%\.codex\config.toml`.
+2. Add this table below the `[mcp_servers.km003c]` entry. `approve` runs the tool without
+   asking, and `prompt` always asks first.
+
+    ```toml
+    [mcp_servers.km003c.tools]
+    device_info = { approval_mode = "approve" }
+    measure = { approval_mode = "approve" }
+    pd_status = { approval_mode = "approve" }
+    stream_start = { approval_mode = "approve" }
+    stream_status = { approval_mode = "approve" }
+    stream_samples = { approval_mode = "approve" }
+    stream_stop = { approval_mode = "approve" }
+    pd_capture_start = { approval_mode = "approve" }
+    pd_capture_wait = { approval_mode = "approve" }
+    pd_capture_mark = { approval_mode = "approve" }
+    pd_capture_stop = { approval_mode = "approve" }
+    pd_capture_read = { approval_mode = "approve" }
+    device_release = { approval_mode = "approve" }
+    trigger_detect = { approval_mode = "prompt" }
+    trigger_enter = { approval_mode = "prompt" }
+    trigger_pd_source_caps = { approval_mode = "prompt" }
+    trigger_pd_request = { approval_mode = "prompt" }
+    trigger_fast_charge = { approval_mode = "prompt" }
+    trigger_reset = { approval_mode = "prompt" }
+    trigger_close = { approval_mode = "prompt" }
+    trigger_raw = { approval_mode = "prompt" }
+    ```
+
+3. Start a new Codex session. The 13 measurement, stream, capture, and release tools now
+   run without an approval prompt. Codex asks before each trigger call.
+
+As in the Claude Code lists, the `trigger_*` tools are set to `prompt` because they can
+make a charger change VBUS. Codex would ask for them without an entry, and the explicit
+entries keep it asking when the server's default changes: a per-tool `approval_mode`
+overrides `default_tools_approval_mode`, so setting that key to `approve` in
+`[mcp_servers.km003c]` does not silence the prompt. The remaining mode, `writes`, asks for
+every tool not marked read-only and so asks for all of this server's tools.
+
+## Sharing the meter with other programs
+
+Close the ChargerLab POWER-Z PC software before using the server: only one program can
+hold the meter's USB interface. The server reports `DeviceBusyError` otherwise, with the
+likely holders; on macOS it also names the holding process from `ioreg`, for example
 `pid 46945, python3.14`. This server releases the meter 2 s after its last use, and
 `device_release` releases it at once, so another program can use the meter while this
 server keeps running.
 
-### macOS and Linux
-
-```sh
-uv sync --extra dev
-```
-
-The server loads libusb-1.0 in this order: the file named by `KM003C_LIBUSB`, the copy
-bundled with `libusb-package`, then the system library through pyusb's normal search.
-On macOS, including Apple Silicon, the bundled copy works without a driver or `sudo`.
-If it does not load, install Homebrew's libusb (`brew install libusb`); pyusb finds
-`/opt/homebrew/lib/libusb-1.0.dylib` on its own. On Linux, the user also needs read and
-write access to the meter's USB device node, usually through a udev rule for
-`5FC9:0063`.
-
-The trigger port is found by USB VID and PID, so on macOS it is the meter's
-`/dev/cu.usbmodem*` device even when other USB serial devices are attached. Register the
-server with Claude Code through `uv`:
-
-```sh
-claude mcp add km003c -- uv --directory <repo> run km003c-mcp
-```
-
-## Register with Claude Code
-
-```powershell
-claude mcp add km003c -- <repo>\.venv\Scripts\km003c-mcp.exe
-```
-
 ## Configuration (environment variables)
+
 
 | Variable | Purpose |
 |---|---|
 | `KM003C_SERIAL` | Pick a meter by USB serial number when several are attached |
-| `KM003C_COM_PORT` | Override the trigger's virtual serial port (e.g. `COM14`) |
+| `KM003C_COM_PORT` | Override the trigger's virtual serial port. The value is a port name such as `COM14` on Windows, or a device path such as `/dev/cu.usbmodem1101` on macOS |
 | `KM003C_ENABLE_TRIGGER` | `1` registers the `trigger_*` tools. Unset, or any other value such as `0` or `false`, leaves every one of them out of the tool list, so an agent can neither see nor call them |
 | `KM003C_IDLE_RELEASE_S` | Release the meter's USB interface this many seconds after the last tool call, PD capture, or stream that uses it ends; the next call claims it again. Unset gives 2. `0` releases at once; `never` keeps the meter claimed until the server exits |
 | `KM003C_PD_POLL_MS` | PD capture poll interval in milliseconds, 1 to 10000 (default 50; the meter buffers a whole negotiation between polls) |
@@ -71,11 +273,11 @@ to get the same behavior from either build.
 
 | Tool | What it does |
 |---|---|
-| `device_info` | Model, hardware/firmware version, serial, trigger COM port |
+| `device_info` | Model, hardware/firmware version, serial, trigger serial port |
 | `measure` | VBUS/IBUS/power, CC1/CC2, D+/D−, VDD, temperature; optional averaging |
 | `pd_status` | PD-side snapshot (VBUS, IBUS, CC1, CC2). During a PD capture it returns the latest status block the capture received, with the meter's timestamp and its age in milliseconds |
 | `stream_start` / `stream_status` / `stream_samples` / `stream_stop` | Background sampling at 2/10/50/1000 SPS with min/max/mean, energy (Wh), charge (mAh), dropped-sample count and optional CSV |
-| `pd_capture_start` / `pd_capture_wait` / `pd_capture_mark` / `pd_capture_stop` | Background PD capture to a capture file, with stop conditions. Start enables the meter's PD monitor and reports the outcome; stop disables it. See "PD capture files" below |
+| `pd_capture_start` / `pd_capture_wait` / `pd_capture_mark` / `pd_capture_stop` | Background PD capture to a capture file, with stop conditions. Start enables the meter's PD monitor and reports the outcome; stop disables it. See [PD capture files](docs/pd-capture.md) |
 | `pd_capture_read` | Read a capture file in a bounded mode: `summary`, `messages`, `facts`, or `full`. Decodes the full USB PD R3.1 message set: PDOs and RDOs (including PPS, AVS, and EPR), PD 3.x data objects, extended messages with chunk reassembly, and structured VDMs (Discover Identity including cable VDOs, SVIDs, DisplayPort and Thunderbolt 3 alternate modes). Never touches the meter |
 | `device_release` | Release the meter's USB interface now so another program can claim it; refused while a PD capture or stream runs |
 | `trigger_detect` / `trigger_enter` | Protocol detection (`entry list`, `entry list+`) and entering a protocol |
@@ -83,7 +285,7 @@ to get the same behavior from either build.
 | `trigger_fast_charge` | QC2/QC3/FCP/AFC/SFCP/SCP/VFCP/TFCP/UFCS voltage requests |
 | `trigger_reset` / `trigger_close` / `trigger_raw` | Reset, leave trigger mode, or send any documented command |
 
-Trigger requests make the charger raise VBUS on the meter's output — disconnect
+Trigger requests make the charger raise VBUS on the meter's output, so disconnect
 sensitive loads first. Unless `KM003C_ENABLE_TRIGGER=1` is set, none of the trigger
 tools is registered, `trigger_detect` included, because protocol probing can also make a
 charger change VBUS.
@@ -91,140 +293,52 @@ charger change VBUS.
 Positive IBUS means current flows from the meter's USB-C receptacle (input) to its plug
 (output).
 
+The trigger's virtual serial port is found by USB VID and PID, so other USB serial devices
+attached to the host do not confuse it. It is a `COM` port on Windows and the meter's
+`/dev/cu.usbmodem*` device on macOS. `KM003C_COM_PORT` overrides the search.
+
 ## PD capture files
 
-A PD capture writes a file in the `km003c-capture` format, version 1: JSON Lines, one
-record per line, each written and flushed as it arrives, so a crash keeps everything
-before it. The file holds the meter's raw bytes and only a header summary of each
-message. Full decodes are computed when the file is read, so decoder fixes apply to old
-captures and the files stay small.
-
-### Starting, waiting, and stopping
-
-`pd_capture_start(path?, label?, provenance?, stop_after_messages?, stop_on?, settle_ms=0,
-timeout_s=60, status_interval_ms=100)` starts a capture and returns the file's absolute
-path. Start the capture before the stimulus: the meter records only what happens after
-its PD monitor is enabled.
-
-- `path` names the file, or a directory when it exists or ends with `/`. Without it the
-  file goes in `KM003C_CAPTURE_DIR`, else `./captures`, named from the UTC start time and
-  the label. An existing file is never overwritten.
-- `label` and `provenance` (any JSON object, such as the charger, the cable, and the
-  firmware under test) go into the header.
-- `stop_on` is `none`, `contract` (a PS_RDY on SOP after an Accept of a Request), or
-  `identity` (a Discover Identity ACK on SOP, from either port).
-- `stop_after_messages` stops after that many non-GoodCRC messages on any SOP.
-- `settle_ms` keeps capturing for that long after the condition is met. A charger may send
-  its own Discover Identity seconds after PS_RDY, so `stop_on="identity"` or a contract
-  capture that should include identity needs a settle time.
-- `timeout_s` always ends the capture. A condition met during its settle time keeps its own
-  reason; otherwise the reason is `timeout`.
-- `status_interval_ms` sets how often a status record is written. Every poll that carries
-  events also writes one.
-
-`settle_ms` and `status_interval_ms` count meter time, taken from the status blocks, so a
-replayed capture stops at the same record; `timeout_s` counts host time.
-
-`pd_capture_wait(timeout_s=60)` blocks until the capture stops or the timeout passes and
-returns the capture's summary, with `running` saying which happened. `pd_capture_mark(text)`
-writes an annotation, such as "stimulus GSrC sent". `pd_capture_stop()` stops the capture
-and returns its summary. A capture holds its claim on the meter until it stops; reading a
-file never claims the meter.
-
-When the server receives SIGTERM, it stops a running capture with footer reason `manual`,
-stops a running stream, releases the meter, and exits with status 0. It exits after 10 s
-even if a cleanup step hangs.
-
-### Record types
-
-| `type` | Fields |
-|---|---|
-| `header` | `format` (`km003c-capture`), `version` (1), `started_utc`, `meter` {`serial`, `fw_version`, `hw_version`, `model`}, `server` {`version`, `poll_ms`}, `pd_monitor` {`enabled`, `accepted`, `outcome`, `attempts`, `last_reply`}, `label`, `provenance`, `stop` (the stop options) |
-| `status` | `t_host`, `t_meter_ms`, `vbus_mv`, `ibus_ma`, `cc1_mv`, `cc2_mv`, `raw` (the 12-byte status block) |
-| `pd` | `i`, `t_meter_ms`, `sop`, `wire` (the message bytes), `raw_event` (size flag, timestamp, SOP byte, and wire), and the header summary: `msg`, `msg_id`, `power_role` and `data_role` (SOP), `cable_plug` (SOP' and SOP''), `spec_rev`, `num_objects`, `extended` |
-| `conn` | `t_meter_ms`, `code` (the raw connection code: 0x11 and 0x12 on firmware 2.0.0, 0x21 and 0x22 on others), `event` (`connect`, `disconnect`, or `connection` for an unknown code), `raw_event` |
-| `mark` | `t_host`, `text` |
-| `error` | `t_host`, `kind`, `message`, and `payload` (the PdPacket hex) when a payload failed to parse |
-| `footer` | `stopped_utc`, `reason` (`messages`, `contract`, `identity`, `timeout`, `manual`, or `error`), `counts` by message type, `messages` (non-GoodCRC), `conn`, `marks`, `errors`, `vbus_mv` {`first`, `last`, `min`, `max`} over every poll |
-
-`t_host` is Unix time in seconds; `t_meter_ms` is the meter's uptime in milliseconds, a
-32-bit value that PD messages, connection events, and status blocks all carry in full.
-Marks and errors have only `t_host`; readers place them in meter time from the nearest
-status record. The footer is written on every stop, errors included. A payload that
-fails to parse becomes an `error` record and the capture continues; ten failed polls in a
-row end it with reason `error`.
-
-### Reading a capture
-
-`pd_capture_read(path?, mode="summary", sop?, types?, since?, after?, limit?, include_goodcrc=False)`
-reads a file without touching the meter. Without `path` it reads this session's running
-or last capture; a bare file name is also looked up in the capture directory. Every
-decoded value sits beside the wire hex it came from.
-
-| Mode | Returns |
-|---|---|
-| `summary` (default) | At most about 2 KB plus the file's path, which is never shortened: one line per non-GoodCRC message, such as `t=14637562 SOP Request pos 4, 3.0 A [8210 2cb18441]`, plus connection events, marks, and errors; counts by message type; VBUS first, last, min, and max; the final contract; and warnings. When the lines do not fit, lines from the middle are dropped, `truncated` is true, and a marker line names the omitted range |
-| `messages` | The same lines, filtered and paged; `limit` defaults to 50. Pass a page's `next_after` as `after` for the next page; `next_after` is absent on the last page |
-| `facts` | What a register cross-check needs: Source_Capabilities PDOs, each Request RDO with its object position, the PDO it names, and its Accept and PS_RDY times, the final contract, and Discover Identity ACKs grouped by SOP and by sender (power and data role on SOP, cable or port on SOP'), each VDO beside its decode. At most about 8 KB: a long capture keeps the latest of each kind, always including the final contract's Source_Capabilities and Request and the latest ACK of each SOP and sender, and `omitted` counts the rest |
-| `full` | Complete decodes of the filtered messages, each with its `line`; `limit` defaults to 20, and paging works as in `messages` |
-
-Filters: `sop` (`SOP`, `SOP'`, `SOP''`), `types` (message type names, VDM command names
-such as `Discover_Identity`, and `connect`, `disconnect`, `mark`, `error`), `since` (keeps
-entries at or after that meter time in ms; a mark or error without an estimated time drops
-out), and `include_goodcrc`.
-
-Pages advance by position, not by time: `after` is a line number in the file, exclusive,
-and each page returns the `next_after` to pass next. Marks and errors carry times estimated
-from the host clock, which need not be in order with the meter's, and several messages can
-share a millisecond, so paging by `since` would repeat or skip entries. Use `since` to pick
-a window and `after` to walk through it.
-
-The summary and facts warnings implement the checks to make before comparing a capture
-with anything else:
-
-- No Source_Capabilities, no Request, and VBUS flat (within 500 mV): no negotiation
-  happened in the window, which points at the stimulus, not the protocol.
-- Only connection events: either the partners exchanged no PD messages, for example a
-  source that does not use PD, or the meter's PD monitoring was not active. Firmware
-  2.0.0 captures PD with the monitor off, so on that firmware the first is the likely
-  cause. The warning quotes the header's `pd_monitor`.
-- A Request with no Source_Capabilities before it: the capture started late.
-
-Warnings also report a missing footer (a running or crashed capture), a timeout before
-the stop condition, error records, and unreadable lines.
-
-### Command-line tool
-
-`km003c-capture` shares this code. `summarize` and `facts` read files only and never open
-the meter, so they work where USB access is blocked.
-
-```sh
-km003c-capture summarize captures/km003c-20261123T083005Z.jsonl
-km003c-capture facts captures/km003c-20261123T083005Z.jsonl
-km003c-capture record --stop-on contract --timeout 120 --label "cold attach" captures/
-```
-
-`record` takes the same options as `pd_capture_start` (`--stop-on`, `--stop-after-messages`,
-`--settle-ms`, `--timeout`, `--status-interval-ms`, `--label`, `--provenance`). It prints
-`capturing <path>` once capturing has begun, so a script can start it in the background and
-prompt for the stimulus after that line. It prints the summary when the capture stops.
-Ctrl-C or SIGTERM stops the capture with reason `manual` within about 0.2 s, once a start
-in progress has finished; further ones change nothing while the footer is written and the
-summary printed.
-
-| Exit code | Meaning |
-|---|---|
-| 0 | Success: the capture stopped on its condition, by hand, or at the timeout when it had no condition |
-| 1 | The capture ended with an error, or the meter could not be used |
-| 2 | An unreadable file or a bad argument |
-| 3 | `record` reached `--timeout` before `--stop-on` or `--stop-after-messages` was met |
+A PD capture writes a JSON Lines file that holds the meter's raw bytes; full decodes are
+computed when the file is read. [docs/pd-capture.md](docs/pd-capture.md) describes the
+capture tools and their options, the record types, the `pd_capture_read` modes and
+filters, and the `km003c-capture` command-line tool, which summarizes capture files
+without opening the meter.
 
 ## Tests
 
+The unit tests need no hardware. The hardware tests need a meter attached, the POWER-Z PC
+software closed, and `KM003C_HW=1`; without that variable they are skipped.
+
+### Windows
+
+Run the unit tests in PowerShell, in the root of the clone:
+
 ```powershell
-.venv\Scripts\pytest                      # unit tests (no hardware)
-$env:KM003C_HW="1"; .venv\Scripts\pytest tests\test_hw.py   # against a real meter
+.venv\Scripts\pytest
 ```
+
+Run the hardware tests:
+
+```powershell
+$env:KM003C_HW="1"; .venv\Scripts\pytest tests\test_hw.py
+```
+
+### macOS and Linux
+
+Run the unit tests in the root of the clone:
+
+```bash
+uv run --extra dev pytest -m "not hw"
+```
+
+Run the hardware tests:
+
+```bash
+KM003C_HW=1 uv run --extra dev pytest tests/test_hw.py
+```
+
+### Interactive tests and the golden capture
 
 Hardware tests that need a person to plug cables, such as the cold attach that checks a
 capture stops on `contract`, also need `KM003C_HW_INTERACTIVE=1`; they prompt on the
@@ -241,4 +355,4 @@ firmware 2.0.0 payloads; after a deliberate format change, regenerate it with
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

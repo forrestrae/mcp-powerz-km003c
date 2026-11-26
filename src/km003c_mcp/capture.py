@@ -6,7 +6,7 @@ summary of each PD message; full decodes are computed when a file is read
 (:mod:`km003c_mcp.capture_read`), so decoder fixes apply to old captures.
 
 Record types: ``header``, ``status``, ``pd``, ``conn``, ``mark``, ``error``, ``footer``.
-The README describes every field.
+``docs/pd-capture.md`` describes every field.
 """
 
 from __future__ import annotations
