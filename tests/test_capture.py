@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from capture_bench import S3, records
+from capture_bench import POLL_15MS, records
 from km003c_mcp.capture import (
     CaptureSession, CaptureWriter, StopTracker, capture_dir,
     is_discover_identity_ack, new_capture_path,
@@ -131,10 +131,10 @@ def test_timeout_uses_the_host_clock(tmp_path):
     s.finish("timeout")
 
 
-def test_session_replays_s3_to_contract(tmp_path):
+def test_session_replays_the_15ms_capture_to_contract(tmp_path):
     s = session(tmp_path, stop_on="contract")
     reason = None
-    for payload in S3:
+    for payload in POLL_15MS:
         reason = s.ingest(payload)
         if reason:
             break
