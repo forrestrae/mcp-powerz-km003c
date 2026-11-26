@@ -7,7 +7,11 @@ meter's fast-charge protocol trigger as MCP tools (stdio transport).
 ## Install
 
 The server requires Python 3.11 or later. Each platform section below installs the package
-with its development dependencies into `.venv` in the clone.
+with its development dependencies into `.venv` in a clone of this repository.
+
+A clone is needed only to develop or test the server. To use a released version, skip to
+the registration sections: they can run the server straight from GitHub. The driver and
+device-access notes below apply to both routes.
 
 ### Windows
 
@@ -47,15 +51,31 @@ pyusb's normal search.
 
 ## Register with Claude Code
 
-In both commands, `<repo>` is the absolute path of the clone.
+Register the server from a GitHub release to use it, or from a clone to run a working
+copy. In the clone commands, `<repo>` is the absolute path of the clone.
 
-### Windows
+### From GitHub, pinned to a release
+
+This command is the same on Windows, macOS, and Linux and needs no clone. It needs
+[uv](https://docs.astral.sh/uv/) and git. `uvx` builds the tagged release into a cached
+environment on first start and reuses it afterwards.
+
+```bash
+claude mcp add km003c -- uvx --from git+https://github.com/forrestrae/mcp-powerz-km003c@v0.2.1 km003c-mcp
+```
+
+Replace `v0.2.1` with the release to run; the
+[tags page](https://github.com/forrestrae/mcp-powerz-km003c/tags) lists them. The server
+stays on that release until the registration is changed. To move to another release,
+remove the entry with `claude mcp remove km003c` and add it again with the new tag.
+
+### From a clone on Windows
 
 ```powershell
 claude mcp add km003c -- <repo>\.venv\Scripts\km003c-mcp.exe
 ```
 
-### macOS and Linux
+### From a clone on macOS and Linux
 
 ```bash
 claude mcp add km003c -- uv --directory <repo> run km003c-mcp
@@ -112,22 +132,37 @@ Code's file permission rules.
 ## Register with Codex
 
 `codex mcp add` writes the server to `~/.codex/config.toml` as `[mcp_servers.km003c]`, so
-one registration serves every project. In both commands, `<repo>` is the absolute path of
-the clone.
+one registration serves every project. In the clone commands, `<repo>` is the absolute
+path of the clone.
 
-### Windows
+### From GitHub, pinned to a release
+
+This command is the same on Windows, macOS, and Linux and needs no clone. It needs
+[uv](https://docs.astral.sh/uv/) and git. `uvx` builds the tagged release into a cached
+environment on first start and reuses it afterwards.
+
+```bash
+codex mcp add km003c -- uvx --from git+https://github.com/forrestrae/mcp-powerz-km003c@v0.2.1 km003c-mcp
+```
+
+Replace `v0.2.1` with the release to run; the
+[tags page](https://github.com/forrestrae/mcp-powerz-km003c/tags) lists them. The server
+stays on that release until the registration is changed. To move to another release,
+remove the entry with `codex mcp remove km003c` and add it again with the new tag.
+
+### From a clone on Windows
 
 ```powershell
 codex mcp add km003c -- <repo>\.venv\Scripts\km003c-mcp.exe
 ```
 
-### macOS and Linux
+### From a clone on macOS and Linux
 
 ```bash
 codex mcp add km003c -- uv --directory <repo> run km003c-mcp
 ```
 
-On either platform, confirm the registration. The output lists `km003c` with its command:
+After any of these commands, confirm the registration. The output lists `km003c` with its command:
 
 ```bash
 codex mcp list
